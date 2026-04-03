@@ -14,9 +14,9 @@
 |------|------|------|------|
 | work_project_id | number | 是 | 项目ID |
 | work_id | number | 是 | 作品ID |
-| scene_id | number | 是 | 场景ID |
+| scene_id | number | 否 | 场景ID。命中负向/预警并且明确匹配到场景时传；未命中场景时可不传 |
 | opinion | string | 是 | 舆情倾向（正向/负向/中性/预警） |
-| opinion_direction | string | 是 | 主体品牌或指向 |
+| opinion_direction | string | 否 | 主体品牌或指向。无品牌或未命中时可不传 |
 | opinion_think | string | **是** | **AI 思考判断过程（必填）** |
 | reason | string | 是 | 分析原因摘要 |
 
@@ -27,9 +27,7 @@
 {
   "work_project_id": 1001,
   "work_id": 90001,
-  "scene_id": 123,
   "opinion": "正向",
-  "opinion_direction": "卫仕",
   "opinion_think": "1. 品牌识别：内容提到「给猫主子换了卫仕猫粮」\n2. 关键词匹配：检测到正向关键词「推荐」「爱吃」\n3. 情感分析：语气积极，用户对产品满意\n4. 舆情判断：提及自有品牌（卫仕）+ 正向关键词 → 正向\n5. 结论：该内容为正向舆情",
   "reason": "提及自有品牌「卫仕」且包含正向关键词「推荐」「爱吃」"
 }
@@ -73,6 +71,21 @@
 | opinion_think 缺失 | 必须填写思考过程 | `"opinion_think": "1. 品牌识别..."` |
 | opinion_think 过简 | 必须包含 5 个步骤 | 至少包含 5 行，每行一个步骤 |
 | 仅填 reason | 必须分开填写 | opinion_think 记录推理，reason 记录摘要 |
+
+### scene_id / project_scene_id 传值规则
+
+- 当作品命中 **负向** 或 **预警**，且已经明确匹配到对应场景时：
+  - 请求里传 `scene_id`
+  - 响应里通常会回 `project_scene_id`
+- 当作品是 **正向 / 中性**，或者虽然完成分析但**没有匹配到具体场景**时：
+  - `scene_id` 可以不传
+  - `project_scene_id` 可以为空
+
+推荐实践：
+
+- 负向 / 预警：传 `scene_id`
+- 正向 / 中性：可不传 `scene_id`
+- `opinion_direction` 在“无品牌”场景下也可不传
 
 **响应**:
 ```json
