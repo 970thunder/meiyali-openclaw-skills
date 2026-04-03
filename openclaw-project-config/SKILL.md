@@ -91,13 +91,33 @@ echo "OPENCLAW_API_KEY=your_api_key_here" >> ~/.openclaw/workspace/.env.meiyali
     "brand_description": "XX品牌猫粮",
     "brand_tags_description": "宠物/猫粮/口碑",
     "competing_brand_description": "YY品牌，ZZ品牌",
-    "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
-    "secret": "ding-secret",
-    "ai_table_webhook": "https://dingtalk.ai.table/webhook",
-    "search_key_list": "猫粮,宠物食品"
+    "webhook_broadcast_within_days": 30,
+    "webhook_broadcast_configs": [
+      {
+        "config_name": "钉钉主推送",
+        "config_key": "dingtalk_primary",
+        "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
+        "secret": "ding-secret",
+        "enable": true
+      },
+      {
+        "config_name": "AI表格",
+        "config_key": "ai_table",
+        "webhook_url": "https://dingtalk.ai.table/webhook",
+        "secret": "",
+        "enable": false
+      }
+    ]
   }
 }
 ```
+
+> 📌 **webhook_broadcast_configs 字段说明：**
+> - `config_name`: 配置名称，用于标识
+> - `config_key`: 配置唯一标识（如 `dingtalk_primary`, `ai_table`）
+> - `webhook_url`: Webhook 地址
+> - `secret`: 密钥（钉钉需要，其他可为空）
+> - `enable`: 是否启用
 
 ### 更新项目
 
@@ -108,7 +128,16 @@ echo "OPENCLAW_API_KEY=your_api_key_here" >> ~/.openclaw/workspace/.env.meiyali
   "params": {
     "id": <项目ID>,
     "project_name": "猫粮舆情监控（更新）",
-    "search_key_list": "猫粮,宠物食品,营养餐"
+    "webhook_broadcast_within_days": 7,
+    "webhook_broadcast_configs": [
+      {
+        "config_name": "钉钉主推送",
+        "config_key": "dingtalk_primary",
+        "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=yyy",
+        "secret": "new-secret",
+        "enable": true
+      }
+    ]
   }
 }
 ```
@@ -201,6 +230,6 @@ echo "OPENCLAW_API_KEY=your_api_key_here" >> ~/.openclaw/workspace/.env.meiyali
 | `401 Unauthorized` | API Key 无效或未配置 | 配置有效的 `OPENCLAW_API_KEY` |
 | `404 Not Found` | 项目/场景不存在 | 检查 ID 是否正确 |
 | `Validation failed` | 必填字段缺失 | 检查请求参数 |
-| `webhook_url is required` | 缺少钉钉 Webhook | 在项目中配置 `webhook_url` |
+| `webhook_broadcast_configs is required` | 缺少 Webhook 配置 | 在项目中配置 `webhook_broadcast_configs` 数组 |
 
 详细 API 文档参见 [references/api.md](references/api.md)

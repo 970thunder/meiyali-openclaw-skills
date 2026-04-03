@@ -20,11 +20,19 @@
     "brand_description": "XX品牌猫粮",
     "brand_tags_description": "宠物/猫粮/口碑",
     "competing_brand_description": "YY品牌，ZZ品牌",
-    "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
-    "secret": "ding-secret",
-    "ai_table_webhook": "https://dingtalk.ai.table/webhook",
-    "search_key_list": "猫粮,宠物食品",
-    "yunfan_id": 123
+    "yunfan_id": 123,
+    "webhook_broadcast_within_days": 30,
+    "webhook_broadcast_configs": [
+      {
+        "config_name": "钉钉主推送",
+        "config_key": "dingtalk_primary",
+        "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
+        "secret": "ding-secret",
+        "enable": true
+      }
+    ],
+    "created_at": "2024-01-15T10:30:00Z",
+    "updated_at": "2024-01-15T10:30:00Z"
   },
   "msg": "成功"
 }
@@ -51,18 +59,56 @@
   "brand_description": "XX品牌猫粮",
   "brand_tags_description": "宠物/猫粮/口碑",
   "competing_brand_description": "YY品牌，ZZ品牌",
-  "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
-  "secret": "ding-secret",
-  "ai_table_webhook": "https://dingtalk.ai.table/webhook",
-  "search_key_list": "猫粮,宠物食品"
+  "webhook_broadcast_within_days": 30,
+  "webhook_broadcast_configs": [
+    {
+      "config_name": "钉钉主推送",
+      "config_key": "dingtalk_primary",
+      "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
+      "secret": "ding-secret",
+      "enable": true
+    },
+    {
+      "config_name": "AI表格",
+      "config_key": "ai_table",
+      "webhook_url": "https://dingtalk.ai.table/webhook",
+      "secret": "",
+      "enable": false
+    }
+  ]
 }
 ```
+
+**字段说明**:
+- `webhook_broadcast_within_days`: Webhook 广播推送的时间范围（天数），0 表示不限制
+- `webhook_broadcast_configs`: Webhook 配置数组
+  - `config_name`: 配置名称
+  - `config_key`: 配置唯一标识（如 `dingtalk_primary`, `ai_table`）
+  - `webhook_url`: Webhook 地址
+  - `secret`: 签名密钥（钉钉需要）
+  - `enable`: 是否启用
 
 ### 更新项目
 
 **端点**: `PUT /openclaw/project/update`
 
-**请求体**: 同创建，额外需要 `id` 字段
+**请求体**:
+```json
+{
+  "id": 30001,
+  "project_name": "猫粮舆情监控（更新）",
+  "webhook_broadcast_within_days": 7,
+  "webhook_broadcast_configs": [
+    {
+      "config_name": "钉钉主推送",
+      "config_key": "dingtalk_primary",
+      "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=yyy",
+      "secret": "new-secret",
+      "enable": true
+    }
+  ]
+}
+```
 
 ### 删除项目
 
