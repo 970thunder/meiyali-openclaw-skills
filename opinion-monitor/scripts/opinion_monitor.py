@@ -35,7 +35,7 @@ import argparse
 from typing import Dict, List, Optional, Tuple
 
 API_KEY = "3ae4d7b1f3e2c0d58326e52a4cc98fb6b3fdb4849a9b945706cb367a78c0c713"
-BASE_URL = "http://host.docker.internal:8888"
+BASE_URL = "http://127.0.0.1:8888"
 HEADERS = {"api-key": API_KEY, "Content-Type": "application/json"}
 
 def api_request(endpoint: str, method: str = "GET", data: dict = None) -> Optional[dict]:
@@ -409,8 +409,8 @@ def analyze_sentiment(title: str, content: str, criteria: OpinionCriteriaParser)
     opinion_think = build_opinion_think(brand_info, [], "无明显情感", "中性", "")
     return {"opinion": opinion, "opinion_direction": opinion_direction, "reason": reason, "opinion_think": opinion_think}
 
-def upload_opinion(work_project_id: int, work_id: int, scene_id: Optional[int],
-                   opinion: str, opinion_direction: Optional[str], reason: str,
+def upload_opinion(work_project_id: int, work_id: int, scene_id: int,
+                   opinion: str, opinion_direction: str, reason: str,
                    opinion_think: str = None) -> bool:
     """上传舆情分析结果
 
@@ -423,13 +423,11 @@ def upload_opinion(work_project_id: int, work_id: int, scene_id: Optional[int],
     data = {
         "work_project_id": work_project_id,
         "work_id": work_id,
+        "scene_id": scene_id,
         "opinion": opinion,
+        "opinion_direction": opinion_direction,
         "reason": reason
     }
-    if scene_id:
-        data["scene_id"] = scene_id
-    if opinion_direction:
-        data["opinion_direction"] = opinion_direction
     if opinion_think:
         data["opinion_think"] = opinion_think
     result = api_request("/openclaw/opinion/upload", "POST", data)
@@ -469,17 +467,12 @@ def process_task_items(task_data: dict, work_project_id: int, scene_id: int,
         else:
             stats["neutral"] += 1
         
-        matched_scene_id = scene_id if analysis["opinion"] in ("负向", "预警") else None
-        matched_direction = analysis["opinion_direction"]
-        if matched_direction in ("", "无品牌") or analysis["opinion"] not in ("负向", "预警"):
-            matched_direction = None
-
         success = upload_opinion(
             work_project_id=work_project_id,
             work_id=work_id,
-            scene_id=matched_scene_id,
+            scene_id=scene_id,
             opinion=analysis["opinion"],
-            opinion_direction=matched_direction,
+            opinion_direction=analysis["opinion_direction"],
             reason=analysis["reason"],
             opinion_think=analysis.get("opinion_think", "")
         )
