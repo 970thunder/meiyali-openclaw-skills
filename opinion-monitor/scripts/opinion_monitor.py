@@ -1,909 +1,1402 @@
 #!/usr/bin/env python3
 """
-舆情监控工作流脚本（编排层）
+舆情监控工作流脚本（项目级版本）
 
-本脚本是 opinion-monitor Skill 的执行入口，负责协调多个子 Skill 完成完整的舆情监控流程。
-
-编排的子 Skill：
-  1. openclaw-project-config   - 获取项目/场景配置
-  2. meiyali-plugin-dy        - 下发抖音搜索任务
-  3. meiyali-plugin-xhs       - 下发小红书搜索任务
-  4. openclaw-task-polling    - 轮询任务结果（内置）
-  5. openclaw-opinion-callback - 上传舆情分析结果
-  6. openclaw-project-config   - 标记任务完成
-
-支持三种执行模式：
-  1. full     - 完整流程（默认）：下发任务 → 轮询 → 分析 → 上传
-  2. dispatch - 仅下发任务：下发任务 → 任务状态 0 → 1 → 2
-  3. process  - 仅处理任务：查询 status=2 → 分析 → 上传 → 状态 2 → 3
-
-使用方式：
-  python3 opinion_monitor.py                    # 完整流程（默认项目和场景）
-  python3 opinion_monitor.py 30001 40001        # 完整流程（指定项目和场景）
-  python3 opinion_monitor.py --mode dispatch    # 仅下发任务
-  python3 opinion_monitor.py --mode process     # 仅处理已完成任务
+新版说明：
+- 不再依赖场景配置
+- 不在定时任务里写死项目 ID
+- 默认从 `/openclaw/project/list` 动态获取项目列表
+- 如需限定项目范围，可在 `.env.meiyali` 中配置 `OPINION_PROJECT_IDS=30001,30002`
+- dispatch/process 通过本地任务队列衔接，避免依赖不存在的任务列表接口
 """
+from __future__ import annotations
+
+import argparse
 import json
-import urllib.request
-import urllib.error
-import ssl
 import os
+import ssl
+import subprocess
 import sys
 import time
-import re
-import argparse
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-API_KEY = "3ae4d7b1f3e2c0d58326e52a4cc98fb6b3fdb4849a9b945706cb367a78c0c713"
-BASE_URL = "http://127.0.0.1:8888"
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = SCRIPT_DIR.parents[2]
+ENV_PATH = WORKSPACE_DIR / ".env.meiyali"
+DATA_DIR = WORKSPACE_DIR / "data"
+QUEUE_PATH = DATA_DIR / "opinion-monitor-task-queue.json"
+
+
+def read_env_file(path: Path) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    if not path.exists():
+        return env
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
+
+
+ENV = read_env_file(ENV_PATH)
+API_KEY = os.getenv("MEIYALI_API_KEY") or os.getenv("API_KEY") or ENV.get("MEIYALI_API_KEY") or ENV.get("API_KEY") or ""
+BASE_URL = (
+    os.getenv("MEIYALI_API_BASE_URL")
+    or os.getenv("API_BASE_URL")
+    or ENV.get("MEIYALI_API_BASE_URL")
+    or ENV.get("API_BASE_URL")
+    or "http://host.docker.internal:8888"
+).rstrip("/")
+CONFIGURED_PROJECT_IDS = (
+    os.getenv("OPINION_PROJECT_IDS")
+    or ENV.get("OPINION_PROJECT_IDS")
+    or os.getenv("OPINION_PROJECT_ID")
+    or ENV.get("OPINION_PROJECT_ID")
+    or ""
+)
 HEADERS = {"api-key": API_KEY, "Content-Type": "application/json"}
+MIN_TEXT_LENGTH = 36
+API_TIMEOUT_SECONDS = int(os.getenv("OPENCLAW_API_TIMEOUT") or ENV.get("OPENCLAW_API_TIMEOUT") or "30")
+API_RETRY_COUNT = max(1, int(os.getenv("OPENCLAW_API_RETRY_COUNT") or ENV.get("OPENCLAW_API_RETRY_COUNT") or "3"))
+ANALYSIS_RETRY_COUNT = max(1, int(os.getenv("OPENCLAW_ANALYSIS_RETRY_COUNT") or ENV.get("OPENCLAW_ANALYSIS_RETRY_COUNT") or "2"))
+TASK_RESULT_FAIL_MAX = max(1, int(os.getenv("OPENCLAW_TASK_RESULT_FAIL_MAX") or ENV.get("OPENCLAW_TASK_RESULT_FAIL_MAX") or "6"))
+MAX_WORKS_PER_TASK = 10
+DY_SEARCH_COUNT = min(MAX_WORKS_PER_TASK, max(1, int(os.getenv("OPENCLAW_DY_SEARCH_COUNT") or ENV.get("OPENCLAW_DY_SEARCH_COUNT") or "10")))
+XHS_SEARCH_COUNT = min(MAX_WORKS_PER_TASK, max(1, int(os.getenv("OPENCLAW_XHS_SEARCH_COUNT") or ENV.get("OPENCLAW_XHS_SEARCH_COUNT") or "10")))
+PROCESS_MAX_TASKS_PER_RUN = max(1, int(os.getenv("OPENCLAW_PROCESS_MAX_TASKS_PER_RUN") or ENV.get("OPENCLAW_PROCESS_MAX_TASKS_PER_RUN") or "4"))
+CHAT_SAMPLE_SIZE = min(5, max(3, int(os.getenv("OPENCLAW_CHAT_SAMPLE_SIZE") or ENV.get("OPENCLAW_CHAT_SAMPLE_SIZE") or "5")))
+CHAT_MAX_TASKS_SCAN = max(1, int(os.getenv("OPENCLAW_CHAT_MAX_TASKS_SCAN") or ENV.get("OPENCLAW_CHAT_MAX_TASKS_SCAN") or "3"))
+CHAT_TASK_RESULT_TIMEOUT_SECONDS = max(2, int(os.getenv("OPENCLAW_CHAT_TASK_RESULT_TIMEOUT") or ENV.get("OPENCLAW_CHAT_TASK_RESULT_TIMEOUT") or "4"))
+CHAT_API_RETRY_COUNT = max(1, int(os.getenv("OPENCLAW_CHAT_API_RETRY_COUNT") or ENV.get("OPENCLAW_CHAT_API_RETRY_COUNT") or "1"))
+CHAT_WORK_IDS_PER_TASK = max(CHAT_SAMPLE_SIZE, min(20, int(os.getenv("OPENCLAW_CHAT_WORK_IDS_PER_TASK") or ENV.get("OPENCLAW_CHAT_WORK_IDS_PER_TASK") or "20")))
+CHAT_AUTO_DISPATCH = str(os.getenv("OPENCLAW_CHAT_AUTO_DISPATCH") or ENV.get("OPENCLAW_CHAT_AUTO_DISPATCH") or "1").strip().lower() not in {"0", "false", "off", "no"}
+CHAT_DISPATCH_COOLDOWN_SECONDS = max(0, int(os.getenv("OPENCLAW_CHAT_DISPATCH_COOLDOWN") or ENV.get("OPENCLAW_CHAT_DISPATCH_COOLDOWN") or "0"))
+RISK_CONTROL_COOLDOWN_SECONDS = max(0, int(os.getenv("OPENCLAW_RISK_CONTROL_COOLDOWN") or ENV.get("OPENCLAW_RISK_CONTROL_COOLDOWN") or "1800"))
+CHAT_DISPATCH_TIMEOUT_SECONDS = max(1, int(os.getenv("OPENCLAW_CHAT_DISPATCH_TIMEOUT") or ENV.get("OPENCLAW_CHAT_DISPATCH_TIMEOUT") or "4"))
+CHAT_DISPATCH_RETRY_COUNT = max(1, int(os.getenv("OPENCLAW_CHAT_DISPATCH_RETRY_COUNT") or ENV.get("OPENCLAW_CHAT_DISPATCH_RETRY_COUNT") or "1"))
+TASK_STATUS_PENDING_TIMEOUT_SECONDS = max(300, int(os.getenv("OPENCLAW_TASK_STATUS_PENDING_TIMEOUT") or ENV.get("OPENCLAW_TASK_STATUS_PENDING_TIMEOUT") or "1200"))
+ENABLE_DY = str(os.getenv("OPENCLAW_ENABLE_DY") or ENV.get("OPENCLAW_ENABLE_DY") or "1").strip().lower() not in {"0", "false", "off", "no"}
+ENABLE_XHS = str(os.getenv("OPENCLAW_ENABLE_XHS") or ENV.get("OPENCLAW_ENABLE_XHS") or "1").strip().lower() not in {"0", "false", "off", "no"}
+MEDIA_EXTRACT_TIMEOUT_SECONDS = max(1, int(os.getenv("OPENCLAW_MEDIA_EXTRACT_TIMEOUT") or ENV.get("OPENCLAW_MEDIA_EXTRACT_TIMEOUT") or "6"))
+MEDIA_EXTRACT_RETRY_COUNT = max(1, int(os.getenv("OPENCLAW_MEDIA_EXTRACT_RETRY_COUNT") or ENV.get("OPENCLAW_MEDIA_EXTRACT_RETRY_COUNT") or "1"))
+MEDIA_EXTRACT_FAIL_FAST_MAX = max(1, int(os.getenv("OPENCLAW_MEDIA_EXTRACT_FAIL_FAST_MAX") or ENV.get("OPENCLAW_MEDIA_EXTRACT_FAIL_FAST_MAX") or "2"))
+ANALYZE_MAX_TASKS_PER_RUN = max(1, int(os.getenv("OPENCLAW_ANALYZE_MAX_TASKS_PER_RUN") or ENV.get("OPENCLAW_ANALYZE_MAX_TASKS_PER_RUN") or "3"))
+ANALYZE_MAX_ITEMS_PER_RUN = max(1, int(os.getenv("OPENCLAW_ANALYZE_MAX_ITEMS_PER_RUN") or ENV.get("OPENCLAW_ANALYZE_MAX_ITEMS_PER_RUN") or "30"))
+ANALYZE_BATCH_SIZE = max(1, int(os.getenv("OPENCLAW_ANALYZE_BATCH_SIZE") or ENV.get("OPENCLAW_ANALYZE_BATCH_SIZE") or "5"))
+ANALYZE_AGENT_TIMEOUT_SECONDS = max(20, int(os.getenv("OPENCLAW_ANALYZE_AGENT_TIMEOUT") or ENV.get("OPENCLAW_ANALYZE_AGENT_TIMEOUT") or "90"))
+OPENCLAW_BIN = os.getenv("OPENCLAW_BIN") or ENV.get("OPENCLAW_BIN") or "/usr/local/bin/openclaw"
+MEDIA_EXTRACT_DISABLED = False
+MEDIA_EXTRACT_FAILURES = 0
 
-def api_request(endpoint: str, method: str = "GET", data: dict = None) -> Optional[dict]:
-    """通用 API 请求函数"""
-    try:
-        url = f"{BASE_URL}{endpoint}"
-        if method == "GET":
-            req = urllib.request.Request(url, headers=HEADERS)
-        else:
-            body = json.dumps(data).encode() if data else b"{}"
-            req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
-        
-        ctx = ssl._create_unverified_context()
-        response = urllib.request.urlopen(req, context=ctx, timeout=30)
-        return json.loads(response.read())
-    except urllib.error.URLError as e:
-        print(f"❌ 请求失败: {e}")
+
+
+def parse_csv_ids(text: str) -> List[str]:
+    return [item.strip() for item in str(text or "").split(",") if item.strip()]
+
+
+def parse_terms(text: str) -> List[str]:
+    normalized = str(text or "")
+    for sep in ["\n", "，", "/", "、", "；", ";", "|"]:
+        normalized = normalized.replace(sep, ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def api_request(
+    endpoint: str,
+    method: str = "GET",
+    data: Optional[dict] = None,
+    timeout_seconds: Optional[int] = None,
+    retry_count: Optional[int] = None,
+) -> Optional[dict]:
+    if not API_KEY:
+        print("❌ 未找到 API_KEY / MEIYALI_API_KEY")
         return None
-    except Exception as e:
-        print(f"❌ 异常: {e}")
-        return None
-
-def get_project_config(project_id: int) -> Optional[dict]:
-    """获取项目配置
-
-    Skill: openclaw-project-config
-    Action: get_project
-    """
-    result = api_request(f"/openclaw/project/find?id={project_id}")
-    if result and result.get('code') == 0:
-        return result.get('data')
+    url = f"{BASE_URL}{endpoint}"
+    retries = max(1, int(retry_count or API_RETRY_COUNT))
+    timeout = max(1, int(timeout_seconds or API_TIMEOUT_SECONDS))
+    for attempt in range(1, retries + 1):
+        try:
+            if method == "GET":
+                req = urllib.request.Request(url, headers=HEADERS)
+            else:
+                body = json.dumps(data or {}, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
+            response = urllib.request.urlopen(req, context=ssl._create_unverified_context(), timeout=timeout)
+            return json.loads(response.read())
+        except urllib.error.URLError as err:
+            print(f"❌ 请求失败(第{attempt}/{retries}次): {err}")
+        except Exception as err:
+            print(f"❌ 异常(第{attempt}/{retries}次): {err}")
+        if attempt < retries:
+            time.sleep(min(6, attempt * 2))
     return None
 
-def get_scene_config(work_project_id: int) -> List[dict]:
-    """获取场景配置列表
 
-    Skill: openclaw-project-config
-    Action: list_scenes
-    """
-    result = api_request(f"/openclaw/project/scene/list?work_project_id={work_project_id}")
-    if result and result.get('code') == 0:
-        return result.get('data', {}).get('list', [])
+def extract_media_summary(material_urls: List[str], content: str = "") -> str:
+    global MEDIA_EXTRACT_DISABLED, MEDIA_EXTRACT_FAILURES
+    urls = [item for item in material_urls if item][:10]
+    if not urls:
+        return ""
+
+    if MEDIA_EXTRACT_DISABLED:
+        return ""
+
+    result = api_request(
+        "/openclaw/media/extract",
+        "POST",
+        {
+            "material_urls": urls,
+            "content": content,
+        },
+        timeout_seconds=MEDIA_EXTRACT_TIMEOUT_SECONDS,
+        retry_count=MEDIA_EXTRACT_RETRY_COUNT,
+    )
+    if result and result.get("code") == 0:
+        MEDIA_EXTRACT_FAILURES = 0
+        return " ".join(str((result.get("data") or {}).get("summary") or "").split())
+
+    MEDIA_EXTRACT_FAILURES += 1
+    if MEDIA_EXTRACT_FAILURES >= MEDIA_EXTRACT_FAIL_FAST_MAX:
+        MEDIA_EXTRACT_DISABLED = True
+        print("   ⚠️ media/extract 连续失败，本轮已熔断，后续跳过素材抽取避免阻塞")
+    return ""
+
+
+def get_project_list() -> List[dict]:
+    result = api_request("/openclaw/project/list?page=1&pageSize=100")
+    if result and result.get("code") == 0:
+        data = result.get("data") or {}
+        return data.get("list") or []
     return []
 
-def get_scene_detail(scene_id: int) -> Optional[dict]:
-    """获取单个场景详情
 
-    Skill: openclaw-project-config
-    Action: get_scene
-    """
-    result = api_request(f"/openclaw/project/scene/find?id={scene_id}")
-    if result and result.get('code') == 0:
-        return result.get('data')
+def get_project_config(project_id: str) -> Optional[dict]:
+    result = api_request(f"/openclaw/project/find?id={urllib.parse.quote(str(project_id))}")
+    if result and result.get("code") == 0:
+        return result.get("data") or {}
     return None
 
-def dispatch_plugin_task(skill: str, action: str, payload: dict) -> Optional[str]:
-    """下发插件任务
 
-    Skill: meiyali-plugin-dy / meiyali-plugin-xhs
-    Action: dispatch_task
-    """
-    data = {"skill": skill, "action": action, "payload": payload}
-    result = api_request("/openclaw/command/plugin", "POST", data)
-    if result and result.get('code') == 0:
-        return result.get('data', {}).get('task_id')
+def dispatch_plugin_task(
+    skill: str,
+    action: str,
+    payload: dict,
+    timeout_seconds: Optional[int] = None,
+    retry_count: Optional[int] = None,
+) -> Optional[str]:
+    result = api_request(
+        "/openclaw/command/plugin",
+        "POST",
+        {
+            "skill": skill,
+            "action": action,
+            "payload": payload,
+        },
+        timeout_seconds=timeout_seconds,
+        retry_count=retry_count,
+    )
+    if result and result.get("code") == 0:
+        return ((result.get("data") or {}).get("task_id"))
+    if result:
+        print(f"   ❌ 下发失败 {skill}/{action}: code={result.get('code')} msg={result.get('msg') or ''}")
+    else:
+        print(f"   ❌ 下发失败 {skill}/{action}: API 无响应")
     return None
 
-def poll_task_result(task_id: str, max_attempts: int = 20, interval: int = 3) -> Optional[dict]:
-    """轮询任务结果
 
-    Skill: openclaw-task-polling (内置)
-    Action: poll_until_complete
-    """
-    print(f"⏳ 开始轮询任务: {task_id[:10]}...")
-    
-    for i in range(max_attempts):
-        result = api_request(f"/openclaw/task/result?task_id={task_id}")
-        if result and result.get('code') == 0:
-            status = result.get('data', {}).get('task_status')
-            
-            if status == 2:
-                print(f"✅ 任务完成 (第{i+1}次检查)")
-                return result.get('data')
-            elif status == -2:
-                print(f"❌ 任务失败: {result.get('data', {}).get('raw_data', {}).get('message')}")
-                return None
-            
-            print(f"  [{i+1}/{max_attempts}] 状态: {status}, 等待中...")
-        
-        time.sleep(interval)
-    
-    print("⏱️ 轮询超时")
-    return None
-
-def finish_tasks(task_ids: List[str]) -> bool:
-    """标记任务彻底完成
-
-    Skill: openclaw-project-config
-    Action: finish_task
-
-    仅当任务中所有作品都完成舆情分析后才调用此接口。
-    任务状态会从 2 变为 3（任务结束）。
-
-    Returns:
-        True: 标记成功
-        False: 标记失败
-    """
-    if not task_ids:
-        return True
-    
-    print(f"\n🏁 标记任务彻底完成: {task_ids}")
-    data = {"task_ids": task_ids}
-    result = api_request("/openclaw/task/finish", "POST", data)
-    
-    if result and result.get('code') == 0:
-        finished_count = result.get('data', {}).get('finished_count', 0)
-        print(f"✅ 已标记 {finished_count} 个任务为结束状态 (状态=3)")
-        return True
-    else:
-        print(f"❌ 标记失败: {result}")
-        return False
-
-def parse_keywords(keywords: any) -> str:
-    """解析关键词
-    
-    支持两种格式：
-    - 逗号分隔字符串: "猫粮,宠物食品"
-    - 列表: ["猫粮", "宠物食品"]
-    
-    Returns:
-        逗号分隔的字符串（兼容插件 API）
-    """
-    if not keywords:
-        return ""
-    if isinstance(keywords, str):
-        return keywords
-    if isinstance(keywords, list):
-        return ",".join(keywords)
-    return str(keywords)
-
-class OpinionCriteriaParser:
-    """舆情判断标准解析器
-    
-    从场景描述中解析舆情判断标准
-    格式示例：
-    
-    品牌描述:卫仕,醇粹,大玛仕
-    竞品描述:皇家,渴望,爱肯拿
-    正向关键词:推荐,好,喜欢,种草,好评,回购
-    负向关键词:差,避雷,坑,差评,曝光,垃圾
-    """
-    
-    def __init__(self, description: str):
-        self.description = description
-        self.brands: List[str] = []
-        self.competing_brands: List[str] = []
-        self.positive_keywords: List[str] = []
-        self.negative_keywords: List[str] = []
-        self._parse()
-    
-    def _parse(self):
-        """解析场景描述"""
-        lines = self.description.split('\n')
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            if line.startswith('品牌描述:') or line.startswith('品牌:'):
-                self._parse_list(line, ['品牌描述:', '品牌:'], self.brands)
-            elif line.startswith('竞品描述:') or line.startswith('竞品:'):
-                self._parse_list(line, ['竞品描述:', '竞品:'], self.competing_brands)
-            elif line.startswith('正向关键词:') or line.startswith('正向:'):
-                self._parse_list(line, ['正向关键词:', '正向:'], self.positive_keywords)
-            elif line.startswith('负向关键词:') or line.startswith('负向:'):
-                self._parse_list(line, ['负向关键词:', '负向:'], self.negative_keywords)
-            elif line.startswith('中性关键词:') or line.startswith('中性:'):
-                self._parse_list(line, ['中性关键词:', '中性:'], [])
-    
-    def _parse_list(self, line: str, prefixes: List[str], target_list: List[str]):
-        """解析列表格式：前缀:项1,项2,项3"""
-        for prefix in prefixes:
-            if prefix in line:
-                content = line.split(prefix, 1)[1].strip()
-                items = [item.strip() for item in content.replace('，', ',').split(',') if item.strip()]
-                target_list.extend(items)
-                break
-    
-    def get_criteria_summary(self) -> str:
-        """获取标准摘要"""
-        return f"""
-  品牌: {', '.join(self.brands) if self.brands else '未设置'}
-  竞品: {', '.join(self.competing_brands) if self.competing_brands else '未设置'}
-  正向: {', '.join(self.positive_keywords[:5])}{'...' if len(self.positive_keywords) > 5 else ''}
-  负向: {', '.join(self.negative_keywords[:5])}{'...' if len(self.negative_keywords) > 5 else ''}
-""".strip()
-
-def extract_brands_from_content(text: str, brand_list: List[str], competing_list: List[str]) -> Tuple[str, str, bool]:
-    """从内容中提取品牌
-
-    Returns:
-        (自有品牌, 竞品品牌, 是否无品牌)
-    """
-    text_lower = text.lower()
-    own_brand = None
-    competing_brand = None
-
-    for brand in brand_list:
-        if brand.lower() in text_lower:
-            own_brand = brand
-            break
-
-    for brand in competing_list:
-        if brand.lower() in text_lower:
-            competing_brand = brand
-            break
-
-    if own_brand:
-        return (own_brand, None, False)
-    elif competing_brand:
-        return (None, competing_brand, False)
-    else:
-        return (None, None, True)
-
-def build_opinion_think(brand_info: dict, matched_keywords: List[str], sentiment: str, opinion: str, opinion_direction: str) -> str:
-    """构建 AI 思考判断过程
-
-    遵循 SKILL.md 中的 opinion_think 字段规范，必须包含 5 个部分：
-    1. 品牌识别：从内容中识别出哪些品牌（自有品牌/竞品）
-    2. 关键词匹配：检测到哪些正向/负向关键词
-    3. 情感分析：内容的整体语气和情感倾向
-    4. 舆情判断：基于品牌+关键词的判断逻辑
-    5. 结论：最终的舆情判断及建议
-
-    Args:
-        brand_info: 品牌识别信息，包含 own_brand, competing_brand, no_brand
-        matched_keywords: 匹配到的关键词列表
-        sentiment: 情感分析描述
-        opinion: 舆情倾向
-        opinion_direction: 品牌方向
-
-    Returns:
-        opinion_think 字符串，包含完整的推理过程
-    """
-    own_brand = brand_info.get('own_brand')
-    competing_brand = brand_info.get('competing_brand')
-    no_brand = brand_info.get('no_brand')
-
-    if competing_brand:
-        brand识别 = f"竞品「{competing_brand}」"
-        brand_type = "竞品"
-    elif own_brand:
-        brand识别 = f"自有品牌「{own_brand}」"
-        brand_type = "自有品牌"
-    else:
-        brand识别 = "无品牌"
-        brand_type = "无品牌"
-
-    keywords_str = "、".join(matched_keywords) if matched_keywords else "未检测到正/负向关键词"
-
-    if "正向" in opinion:
-        sentiment_desc = "积极正面，用户对产品或品牌持好评态度"
-    elif "负向" in opinion or "预警" in opinion:
-        sentiment_desc = "消极，用户对产品或品牌存在不满或批评"
-    else:
-        sentiment_desc = "客观中性，无明显情感倾向"
-
-    brand_label = "自有品牌" if own_brand else ("竞品" if competing_brand else "")
-    keyword_type = "正向关键词" if any(k in "".join(criteria.positive_keywords if 'criteria' in dir() else []) for k in matched_keywords) else "负向关键词"
-
-    conclusion = ""
-    if opinion == "正向":
-        conclusion = f"该内容为正向舆情，{brand识别}结合正向关键词表明用户对品牌持积极态度"
-    elif opinion == "负向":
-        conclusion = f"该内容为负向舆情，{brand识别}结合负向关键词表明用户对品牌存在不满"
-    elif opinion == "预警":
-        conclusion = f"该内容涉及竞品负面舆情，{brand识别}结合负向关键词需要关注"
-    else:
-        conclusion = "该内容无明显情感倾向，为中性舆情"
-
-    return f"1. 品牌识别：内容中识别出{brand识别}\n2. 关键词匹配：检测到关键词「{keywords_str}」\n3. 情感分析：{sentiment_desc}\n4. 舆情判断：提及{brand_type} + {keyword_type} → {opinion}\n5. 结论：{conclusion}"
-
-def analyze_sentiment(title: str, content: str, criteria: OpinionCriteriaParser) -> dict:
-    """基于场景描述中的标准分析舆情
-
-    返回包含 opinion_think 的完整分析结果
-    """
-    full_text = title + " " + (content or "")
-    text_lower = full_text.lower()
-
-    opinion = "中性"
-    opinion_direction = ""
-    reason = "内容无明显情感倾向"
-    matched_keywords = []
-
-    own_brand, competing_brand, no_brand = extract_brands_from_content(
-        full_text, criteria.brands, criteria.competing_brands
+def get_task_result_response(task_id: str, timeout_seconds: Optional[int] = None, retry_count: Optional[int] = None) -> Optional[dict]:
+    return api_request(
+        f"/openclaw/task/result?task_id={urllib.parse.quote(task_id)}",
+        timeout_seconds=timeout_seconds,
+        retry_count=retry_count,
     )
 
-    brand_info = {'own_brand': own_brand, 'competing_brand': competing_brand, 'no_brand': no_brand}
 
-    if competing_brand:
-        opinion_direction = competing_brand
-        for keyword in criteria.negative_keywords:
-            if keyword in text_lower:
-                matched_keywords.append(keyword)
-                opinion_think = build_opinion_think(brand_info, matched_keywords, "消极", "预警", opinion_direction)
-                return {
-                    "opinion": "预警",
-                    "opinion_direction": opinion_direction,
-                    "reason": f"提及竞品「{competing_brand}」且包含负向关键词「{keyword}」",
-                    "opinion_think": opinion_think
-                }
-        for keyword in criteria.positive_keywords:
-            if keyword in text_lower:
-                matched_keywords.append(keyword)
-                opinion_think = build_opinion_think(brand_info, matched_keywords, "积极", "中性", opinion_direction)
-                return {
-                    "opinion": "中性",
-                    "opinion_direction": opinion_direction,
-                    "reason": f"提及竞品「{competing_brand}」但为正面评价",
-                    "opinion_think": opinion_think
-                }
-        opinion_think = build_opinion_think(brand_info, [], "客观", "中性", opinion_direction)
-        return {
-            "opinion": "中性",
-            "opinion_direction": opinion_direction,
-            "reason": f"提及竞品「{competing_brand}」",
-            "opinion_think": opinion_think
-        }
+def get_task_result(task_id: str, timeout_seconds: Optional[int] = None, retry_count: Optional[int] = None) -> Optional[dict]:
+    result = get_task_result_response(task_id, timeout_seconds=timeout_seconds, retry_count=retry_count)
+    if result and result.get("code") == 0:
+        return result.get("data") or {}
+    return None
 
-    if own_brand:
-        opinion_direction = own_brand
-        for keyword in criteria.positive_keywords:
-            if keyword in text_lower:
-                matched_keywords.append(keyword)
-                opinion_think = build_opinion_think(brand_info, matched_keywords, "积极", "正向", opinion_direction)
-                return {
-                    "opinion": "正向",
-                    "opinion_direction": opinion_direction,
-                    "reason": f"提及品牌「{own_brand}」且包含正向关键词「{keyword}」",
-                    "opinion_think": opinion_think
-                }
-        for keyword in criteria.negative_keywords:
-            if keyword in text_lower:
-                matched_keywords.append(keyword)
-                opinion_think = build_opinion_think(brand_info, matched_keywords, "消极", "负向", opinion_direction)
-                return {
-                    "opinion": "负向",
-                    "opinion_direction": opinion_direction,
-                    "reason": f"提及品牌「{own_brand}」且包含负向关键词「{keyword}」",
-                    "opinion_think": opinion_think
-                }
-        opinion_think = build_opinion_think(brand_info, [], "客观", "中性", opinion_direction)
-        return {
-            "opinion": "中性",
-            "opinion_direction": opinion_direction,
-            "reason": f"提及品牌「{own_brand}」但无明显情感",
-            "opinion_think": opinion_think
-        }
 
-    if no_brand:
-        opinion_think = build_opinion_think(brand_info, [], "客观", "中性", opinion_direction)
-        return {
-            "opinion": "中性",
-            "opinion_direction": "无品牌",
-            "reason": "内容未提及品牌",
-            "opinion_think": opinion_think
-        }
-
-    opinion_think = build_opinion_think(brand_info, [], "无明显情感", "中性", "")
-    return {"opinion": opinion, "opinion_direction": opinion_direction, "reason": reason, "opinion_think": opinion_think}
-
-def upload_opinion(work_project_id: int, work_id: int, scene_id: int,
-                   opinion: str, opinion_direction: str, reason: str,
-                   opinion_think: str = None) -> bool:
-    """上传舆情分析结果
-
-    Skill: openclaw-opinion-callback
-    Action: upload
-
-    Args:
-        opinion_think: AI 思考判断过程（必填），包含品牌识别、关键词匹配、情感分析、判断逻辑、结论
-    """
-    data = {
-        "work_project_id": work_project_id,
-        "work_id": work_id,
-        "scene_id": scene_id,
-        "opinion": opinion,
-        "opinion_direction": opinion_direction,
-        "reason": reason
-    }
-    if opinion_think:
-        data["opinion_think"] = opinion_think
-    result = api_request("/openclaw/opinion/upload", "POST", data)
-    return result and result.get('code') == 0
-
-def process_task_items(task_data: dict, work_project_id: int, scene_id: int, 
-                      criteria: OpinionCriteriaParser) -> dict:
-    """处理任务数据并上传舆情分析"""
-    raw_data = task_data.get('raw_data', {})
-    items = raw_data.get('items', [])
-    
-    stats = {"total": 0, "positive": 0, "negative": 0, "neutral": 0, "warning": 0, "uploaded": 0, "failed": 0}
-    
-    print(f"\n📊 开始处理 {len(items)} 条数据...")
-    print(f"  舆情判断标准:")
-    print(criteria.get_criteria_summary())
-    
-    for i, item in enumerate(items):
-        work_id = item.get('workId')
-        if not work_id:
-            continue
-        
-        stats["total"] += 1
-        
-        author = item.get('author', '')
-        title = item.get('title', '')
-        content = item.get('content') or item.get('desc', '')
-        
-        analysis = analyze_sentiment(title, content, criteria)
-        
-        if analysis["opinion"] == "正向":
-            stats["positive"] += 1
-        elif analysis["opinion"] == "负向":
-            stats["negative"] += 1
-        elif analysis["opinion"] == "预警":
-            stats["warning"] += 1
-        else:
-            stats["neutral"] += 1
-        
-        success = upload_opinion(
-            work_project_id=work_project_id,
-            work_id=work_id,
-            scene_id=scene_id,
-            opinion=analysis["opinion"],
-            opinion_direction=analysis["opinion_direction"],
-            reason=analysis["reason"],
-            opinion_think=analysis.get("opinion_think", "")
-        )
-        
-        if success:
-            stats["uploaded"] += 1
-            print(f"  [{i+1}] ✅ {author[:15]:15} | {title[:25]:25} | {analysis['opinion']:4} | {analysis['opinion_direction']}")
-        else:
-            stats["failed"] += 1
-            print(f"  [{i+1}] ❌ {author[:15]:15} | {title[:25]:25} | 上传失败")
-    
-    return stats
-
-def execute_full_workflow(project_id: int = None, scene_id: int = None) -> dict:
-    """执行完整的舆情监控流程
-
-    编排步骤：
-      1. openclaw-project-config.get_project       - 获取项目配置
-      2. openclaw-project-config.get_scene        - 获取场景配置
-      3. meiyali-plugin-dy.dispatch_task          - 下发抖音任务
-      4. meiyali-plugin-xhs.dispatch_task         - 下发小红书任务
-      5. openclaw-task-polling.poll_until_complete - 轮询任务结果
-      6. (内置) opinion_analysis                  - 舆情分析
-      7. openclaw-opinion-callback.upload         - 上传舆情结果
-      8. openclaw-project-config.finish_task      - 标记任务完成
-    """
-    print("=" * 70)
-    print("🚀 舆情监控完整流程")
-    print("=" * 70)
-    
-    if not project_id:
-        project_id = 1775008425285355
-    if not scene_id:
-        scene_id = 1775008436157844
-    
-    print(f"\n📋 获取项目配置 (ID: {project_id})")
-    project = get_project_config(project_id)
-    if not project:
-        return {"code": 7, "msg": "项目不存在"}
-    print(f"  项目名称: {project.get('project_name')}")
-    
-    print(f"\n🎯 获取场景配置 (ID: {scene_id})")
-    scene = get_scene_detail(scene_id)
-    if not scene:
-        scenes = get_scene_config(project_id)
-        scene = next((s for s in scenes if s['id'] == scene_id), None)
-        if not scene:
-            return {"code": 7, "msg": "场景不存在"}
-    
-    print(f"  场景名称: {scene.get('name')}")
-    print(f"  场景描述: {scene.get('description', '未设置')}")
-    
-    criteria = OpinionCriteriaParser(scene.get('description', ''))
-    
-    print(f"\n📝 解析舆情判断标准:")
-    print(criteria.get_criteria_summary())
-    
-    search_keys = scene.get('search_keys', {})
-    dy_config = None
-    xhs_config = None
-    
-    # 支持两种格式：
-    # 1. dict 格式: {"dy": {"keywords": "xxx", "count": 30}, "xhs": {...}}
-    # 2. list 格式: [{"platform": "抖音", "search_key": "xxx"}, ...]
-    
-    if isinstance(search_keys, dict):
-        # dict 格式
-        if 'dy' in search_keys:
-            dy_config = search_keys['dy']
-        if 'xhs' in search_keys:
-            xhs_config = search_keys['xhs']
-    elif isinstance(search_keys, list):
-        # list 格式
-        for item in search_keys:
-            platform = item.get('platform', '')
-            search_key = item.get('search_key', '')
-            if platform in ['抖音', 'dy']:
-                dy_config = {'keywords': search_key, 'count': 30}
-            elif platform in ['小红书', 'xhs']:
-                xhs_config = {'keywords': search_key, 'count': 20}
-    
-    print("\n📤 下发插件任务")
-    task_ids = []
-    
-    if dy_config:
-        keywords = parse_keywords(dy_config.get('keywords', ''))
-        print(f"  抖音关键词: {keywords}")
-        dy_task_id = dispatch_plugin_task(
-            skill="meiyali-plugin-dy",
-            action="dy.search",
-            payload={
-                "keywords": keywords,
-                "count": dy_config.get('count', 30),
-                "sorts": ["default", "time_descending"],
-                "timeFilter": "7"
-            }
-        )
-        if dy_task_id:
-            task_ids.append(('douyin', dy_task_id))
-            print(f"  ✅ 抖音任务已下发: {dy_task_id[:10]}...")
-    
-    if xhs_config:
-        keywords = parse_keywords(xhs_config.get('keywords', ''))
-        print(f"  小红书关键词: {keywords}")
-        xhs_task_id = dispatch_plugin_task(
-            skill="meiyali-plugin-xhs",
-            action="xhs.search",
-            payload={
-                "keywords": keywords,
-                "count": xhs_config.get('count', 20),
-                "sorts": ["default", "time_descending"],
-                "timeFilter": "7"
-            }
-        )
-        if xhs_task_id:
-            task_ids.append(('xiaohongshu', xhs_task_id))
-            print(f"  ✅ 小红书任务已下发: {xhs_task_id[:10]}...")
-    
-    if not task_ids:
-        return {"code": 7, "msg": "没有可执行的任务"}
-    
-    print("\n⏳ 轮询任务结果")
-    all_stats = {"total": 0, "positive": 0, "negative": 0, "neutral": 0, "warning": 0, "uploaded": 0, "failed": 0}
-    completed_task_ids = []
-    
-    for platform, task_id in task_ids:
-        print(f"\n  [{platform}] 轮询任务...")
-        task_data = poll_task_result(task_id)
-        
-        if task_data:
-            raw_data = task_data.get('raw_data', {})
-            total_items = len(raw_data.get('items', []))
-            
-            stats = process_task_items(task_data, project_id, scene_id, criteria)
-            for key in all_stats:
-                all_stats[key] += stats.get(key, 0)
-            
-            if stats['total'] > 0 and stats['failed'] == 0 and stats['total'] == stats['uploaded']:
-                completed_task_ids.append(task_id)
-    
-    if completed_task_ids:
-        finish_tasks(completed_task_ids)
-    else:
-        print("\n⚠️  未满足标记条件：")
-        print("   - 必须所有作品都完成舆情分析（上传成功）")
-        print("   - 任务状态保持为 2（执行成功）")
-        print("   - 等待后续补全分析后再次调用 finish_task")
-    
-    print("\n" + "=" * 70)
-    print("📊 舆情监控完成")
-    print("=" * 70)
-    print(f"  总数据:   {all_stats['total']} 条")
-    print(f"  正向:    {all_stats['positive']} 条")
-    print(f"  中性:    {all_stats['neutral']} 条")
-    print(f"  负向:    {all_stats['negative']} 条")
-    print(f"  预警:    {all_stats['warning']} 条")
-    print(f"  上传成功: {all_stats['uploaded']} 条")
-    print(f"  上传失败: {all_stats['failed']} 条")
-    
-    return {
-        "code": 0,
-        "data": {
-            "project_id": project_id,
-            "scene_id": scene_id,
-            "project_name": project.get('project_name'),
-            "scene_name": scene.get('name'),
-            "scene_description": scene.get('description'),
-            "criteria": {
-                "brands": criteria.brands,
-                "competing_brands": criteria.competing_brands,
-                "positive_keywords": criteria.positive_keywords,
-                "negative_keywords": criteria.negative_keywords
-            },
-            "status": "completed",
-            "summary": all_stats,
-            "finished_task_ids": completed_task_ids,
-            "task_status": "3" if completed_task_ids else "2"
-        },
-        "msg": "成功"
-    }
-
-def get_completed_tasks(project_id: int = None) -> List[dict]:
-    """查询状态为 2（执行成功）的任务列表
-    
-    Args:
-        project_id: 可选，按项目 ID 过滤
-    
-    Returns:
-        任务列表
-    """
-    endpoint = "/openclaw/task/list?status=2"
-    if project_id:
-        endpoint += f"&project_id={project_id}"
-    
-    result = api_request(endpoint)
-    
-    if result and result.get('code') == 0:
-        return result.get('data', {}).get('list', [])
-    
-    # 如果 API 不存在，返回空列表
-    print("⚠️  查询任务列表 API 可能不存在")
-    print(f"   尝试访问: GET {endpoint}")
+def list_opinions(work_project_id: str, work_ids: List[str]) -> List[dict]:
+    if not work_ids:
+        return []
+    query = "&".join(f"work_ids[]={urllib.parse.quote(str(item))}" for item in work_ids if str(item))
+    result = api_request(f"/openclaw/opinion/list?work_project_id={urllib.parse.quote(str(work_project_id))}&{query}")
+    if result and result.get("code") == 0:
+        data = result.get("data")
+        if isinstance(data, list):
+            return data
     return []
 
-def execute_dispatch_only(project_id: int = None, scene_id: int = None) -> dict:
-    """Part A: 仅下发任务（不下发任务后立即返回，等待定时任务处理）
-    
-    适用于分离模式的任务下发阶段。
-    任务状态流转：0（已创建）→ 1（已下发）→ 2（执行成功）
-    
-    Returns:
-        包含下发任务 ID 的结果
-    """
-    print("=" * 70)
-    print("🚀 舆情监控 - 任务下发模式（Part A）")
-    print("=" * 70)
-    
-    if not project_id:
-        project_id = 1775008425285355
-    if not scene_id:
-        scene_id = 1775008436157844
-    
-    print(f"\n📋 获取项目配置 (ID: {project_id})")
-    project = get_project_config(project_id)
-    if not project:
-        return {"code": 7, "msg": "项目不存在"}
-    print(f"  项目名称: {project.get('project_name')}")
-    
-    print(f"\n🎯 获取场景配置 (ID: {scene_id})")
-    scene = get_scene_detail(scene_id)
-    if not scene:
-        scenes = get_scene_config(project_id)
-        scene = next((s for s in scenes if s['id'] == scene_id), None)
-        if not scene:
-            return {"code": 7, "msg": "场景不存在"}
-    
-    print(f"  场景名称: {scene.get('name')}")
-    
-    # 解析搜索配置
-    search_keys = scene.get('search_keys', {})
-    dy_config = None
-    xhs_config = None
-    
-    if isinstance(search_keys, dict):
-        if 'dy' in search_keys:
-            dy_config = search_keys['dy']
-        if 'xhs' in search_keys:
-            xhs_config = search_keys['xhs']
-    elif isinstance(search_keys, list):
-        for item in search_keys:
-            platform = item.get('platform', '')
-            search_key = item.get('search_key', '')
-            if platform in ['抖音', 'dy']:
-                dy_config = {'keywords': search_key, 'count': 30}
-            elif platform in ['小红书', 'xhs']:
-                xhs_config = {'keywords': search_key, 'count': 20}
-    
-    print("\n📤 下发插件任务")
-    dispatched_tasks = []
-    
-    if dy_config:
-        keywords = parse_keywords(dy_config.get('keywords', ''))
-        print(f"  抖音关键词: {keywords}")
-        dy_task_id = dispatch_plugin_task(
-            skill="meiyali-plugin-dy",
-            action="dy.search",
-            payload={
-                "keywords": keywords,
-                "count": dy_config.get('count', 30),
-                "sorts": ["default", "time_descending"],
-                "timeFilter": "7"
-            }
+
+def finish_tasks(task_ids: List[str]) -> bool:
+    if not task_ids:
+        return True
+    result = api_request("/openclaw/task/finish", "POST", {"task_ids": task_ids})
+    return bool(result and result.get("code") == 0)
+
+
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_queue() -> List[dict]:
+    ensure_data_dir()
+    if not QUEUE_PATH.exists():
+        return []
+    try:
+        return json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def save_queue(records: List[dict]) -> None:
+    ensure_data_dir()
+    QUEUE_PATH.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def upsert_queue_entries(entries: List[dict]) -> None:
+    queue = load_queue()
+    indexed = {str(item.get("task_id")): item for item in queue}
+    for entry in entries:
+        indexed[str(entry.get("task_id"))] = entry
+    save_queue(list(indexed.values()))
+
+
+def has_recent_active_task(queue: List[dict], project_id: str, platform: str, now_ts: int) -> bool:
+    if CHAT_DISPATCH_COOLDOWN_SECONDS <= 0:
+        return False
+    for task in queue:
+        if str(task.get("work_project_id") or "") != str(project_id):
+            continue
+        if str(task.get("platform") or "") != str(platform):
+            continue
+        status = str(task.get("status") or "")
+        if status == "finished" or status.startswith("failed_"):
+            continue
+        queued_at = int(task.get("queued_at") or 0)
+        if queued_at and (now_ts - queued_at) < CHAT_DISPATCH_COOLDOWN_SECONDS:
+            return True
+    return False
+
+
+def infer_failure_at(task: dict) -> int:
+    for key in ["failed_at", "finished_at", "queued_at"]:
+        try:
+            value = int(task.get(key) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def is_risk_control_text(text: str) -> bool:
+    normalized = clean_text(text).lower()
+    if not normalized:
+        return False
+    markers = [
+        "风控", "受限", "限制", "校验", "验证", "验证码", "安全验证", "登录",
+        "登录态", "cookie", "device_fingerprint", "fingerprint", "captcha",
+        "risk", "blocked", "forbidden", "unauthorized", "denied",
+        "fetchedcount: 0", "fetchedcount=0", "空结果",
+    ]
+    return any(token in normalized for token in markers)
+
+
+def get_task_error_text(task_result: dict, task_data: dict) -> str:
+    candidates: List[str] = []
+    for obj in [task_result, task_data, task_data.get("raw_data") or {}]:
+        if not isinstance(obj, dict):
+            continue
+        for key in ["msg", "message", "error", "reason", "detail", "status_message", "statusMessage", "last_error"]:
+            value = obj.get(key)
+            if isinstance(value, str) and clean_text(value):
+                candidates.append(value)
+    return clean_text(" | ".join(candidates))
+
+
+def has_recent_risk_control_failure(queue: List[dict], project_id: str, platform: str, now_ts: int) -> bool:
+    if RISK_CONTROL_COOLDOWN_SECONDS <= 0:
+        return False
+    for task in queue:
+        if str(task.get("work_project_id") or "") != str(project_id):
+            continue
+        if str(task.get("platform") or "") != str(platform):
+            continue
+        status = str(task.get("status") or "")
+        failed_reason = str(task.get("failed_reason") or "")
+        if status != "failed_risk_control" and not is_risk_control_text(failed_reason):
+            continue
+        failed_at = infer_failure_at(task)
+        if failed_at and (now_ts - failed_at) < RISK_CONTROL_COOLDOWN_SECONDS:
+            return True
+    return False
+
+
+class ProjectCriteria:
+    def __init__(self, project: dict):
+        self.project = project
+        self.project_id = str(project.get("id") or "")
+        self.project_name = project.get("project_name") or project.get("name") or "未命名项目"
+        self.brand_description = project.get("brand_description") or ""
+        self.brand_tags_description = project.get("brand_tags_description") or ""
+        self.competing_brand_description = project.get("competing_brand_description") or ""
+        self.search_key_list = project.get("search_key_list") or ""
+        self.opinion_configs = project.get("opinion_configs") or []
+
+        self.own_brands = parse_terms(self.brand_description)
+        self.competing_brands = parse_terms(self.competing_brand_description)
+
+    def summary(self) -> str:
+        return (
+            f"项目: {self.project_name}\n"
+            f"自有品牌: {', '.join(self.own_brands) if self.own_brands else '未设置'}\n"
+            f"竞品品牌: {', '.join(self.competing_brands) if self.competing_brands else '未设置'}\n"
+            f"项目搜索词: {self.search_key_list or '未设置'}\n"
+            f"舆情标准: {json.dumps(self.opinion_configs, ensure_ascii=False)}"
         )
-        if dy_task_id:
-            dispatched_tasks.append({'platform': 'douyin', 'task_id': dy_task_id})
-            print(f"  ✅ 抖音任务已下发: {dy_task_id[:10]}...")
-    
-    if xhs_config:
-        keywords = parse_keywords(xhs_config.get('keywords', ''))
-        print(f"  小红书关键词: {keywords}")
-        xhs_task_id = dispatch_plugin_task(
-            skill="meiyali-plugin-xhs",
-            action="xhs.search",
-            payload={
-                "keywords": keywords,
-                "count": xhs_config.get('count', 20),
-                "sorts": ["default", "time_descending"],
-                "timeFilter": "7"
-            }
-        )
-        if xhs_task_id:
-            dispatched_tasks.append({'platform': 'xiaohongshu', 'task_id': xhs_task_id})
-            print(f"  ✅ 小红书任务已下发: {xhs_task_id[:10]}...")
-    
-    if not dispatched_tasks:
-        return {"code": 7, "msg": "没有可执行的任务"}
-    
-    print("\n" + "=" * 70)
-    print("✅ 任务下发完成")
+
+
+def clean_text(text: str) -> str:
+    return " ".join(str(text or "").replace("\n", " ").split())
+
+
+def trim_text(text: str, limit: int) -> str:
+    value = clean_text(text)
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit]
+
+
+def strip_json_fence(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def extract_json_object(text: str) -> dict:
+    cleaned = strip_json_fence(text)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
+
+
+def upload_opinion(work_project_id: str, work_id: str, analysis: Dict[str, str]) -> bool:
+    opinion_key = trim_text(analysis.get("opinion_key") or "中性", 10) or "中性"
+    opinion_direction = trim_text(analysis.get("opinion_direction") or "未识别品牌", 50) or "未识别品牌"
+    reason = trim_text(analysis.get("reason") or "", 50) or "内容信息有限，暂判中性。"
+    opinion_think = clean_text(analysis.get("opinion_think") or "")
+    payload = {
+        "work_project_id": int(work_project_id),
+        "work_id": int(work_id),
+        "opinion_key": opinion_key,
+        "opinion_direction": opinion_direction,
+        "opinion_think": opinion_think,
+        "reason": reason,
+    }
+    result = api_request("/openclaw/opinion/upload", "POST", payload)
+    if result and result.get("code") == 0:
+        return True
+    print(f"   ⚠️ opinion/upload 失败 work_id={work_id} code={(result or {}).get('code')} msg={(result or {}).get('msg')}")
+    return False
+
+
+def normalize_opinion_key(value: str) -> str:
+    text = clean_text(value).lower()
+    if not text:
+        return ""
+    if text in {"负面", "正面", "中性"}:
+        return text
+    if ("负" in text) or ("negative" in text) or ("neg" == text):
+        return "负面"
+    if ("正" in text) or ("positive" in text) or ("pos" == text):
+        return "正面"
+    if ("中" in text) or ("neutral" in text):
+        return "中性"
+    return ""
+
+
+def build_agent_prompt(criteria: ProjectCriteria, items: List[dict]) -> str:
+    project_context = {
+        "project_id": criteria.project_id,
+        "project_name": criteria.project_name,
+        "brand_description": criteria.brand_description,
+        "brand_tags_description": criteria.brand_tags_description,
+        "competing_brand_description": criteria.competing_brand_description,
+        "search_key_list": criteria.search_key_list,
+        "opinion_configs": criteria.opinion_configs,
+    }
+    batch_items = []
+    for item in items:
+        batch_items.append({
+            "work_id": item["work_id"],
+            "title": item["title"],
+            "content": item["content"],
+            "media_summary": item["media_summary"],
+            "brand_hint": item["brand_hint"],
+            "brand_type_hint": item["brand_type_hint"],
+        })
+
+    return (
+        "你是舆情分析助手。请严格根据项目配置、自有品牌、竞品描述、主题标签描述、作品标题、正文、素材摘要，"
+        "为每条作品输出结构化舆情判断。\n"
+        "要求：\n"
+        "1. 只能输出 JSON，不要输出 markdown。\n"
+        "2. opinion_key 只能是“正面”“负面”“中性”之一。\n"
+        "3. opinion_direction 应填写讨论主体；若无法明确识别主体，可写空字符串。\n"
+        "4. reason 必须是基于真实语义判断的一句话中文，不要写“检测到关键词”“命中词”这类机械表述。\n"
+        "5. opinion_think 需要简要说明判断过程，体现你如何结合标题、正文、素材摘要与项目标准得出结论。\n"
+        "6. 如果文本信息不足但素材摘要提供了有效线索，要把素材摘要纳入判断。\n"
+        "7. 如果无法从内容看出明确褒贬，默认判为中性，不要强行猜测。\n"
+        "8. 返回格式必须为 {\"results\":[...]}，results 内每项包含 work_id、opinion_key、opinion_direction、reason、opinion_think。\n\n"
+        f"项目配置:\n{json.dumps(project_context, ensure_ascii=False, indent=2)}\n\n"
+        f"待分析作品:\n{json.dumps(batch_items, ensure_ascii=False, indent=2)}"
+    )
+
+
+def run_openclaw_agent(message: str) -> dict:
+    command = [
+        OPENCLAW_BIN,
+        "agent",
+        "--agent",
+        "main",
+        "--json",
+        "--timeout",
+        str(ANALYZE_AGENT_TIMEOUT_SECONDS),
+        "--message",
+        message,
+    ]
+    env = os.environ.copy()
+    env["OPENCLAW_WORKSPACE"] = str(WORKSPACE_DIR)
+    result = subprocess.run(
+        command,
+        cwd=str(WORKSPACE_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=ANALYZE_AGENT_TIMEOUT_SECONDS + 30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "openclaw agent 调用失败")
+    payload = extract_json_object(result.stdout)
+    payloads = ((payload.get("result") or {}).get("payloads")) or payload.get("payloads") or []
+    if isinstance(payloads, list) and payloads:
+        text = (payloads[0] or {}).get("text") or ""
+        if text:
+            return extract_json_object(text)
+    for candidate in [
+        (payload.get("result") or {}).get("text"),
+        payload.get("text"),
+        payload.get("output"),
+        payload.get("message"),
+    ]:
+        if isinstance(candidate, str) and candidate.strip():
+            return extract_json_object(candidate)
+    raise RuntimeError("openclaw agent 未返回 payload")
+
+
+def analyze_sentiment_batch(items: List[dict], criteria: ProjectCriteria) -> Dict[str, Dict[str, str]]:
+    if not items:
+        return {}
+    last_err = ""
+    response: dict = {}
+    for attempt in range(1, ANALYSIS_RETRY_COUNT + 1):
+        try:
+            response = run_openclaw_agent(build_agent_prompt(criteria, items))
+            break
+        except Exception as err:
+            last_err = clean_text(str(err))
+            print(f"   ⚠️  OpenClaw 分析重试 {attempt}/{ANALYSIS_RETRY_COUNT} 失败: {err}")
+            if attempt < ANALYSIS_RETRY_COUNT:
+                time.sleep(min(3, attempt * 2))
+    if not response:
+        raise RuntimeError(last_err or "OpenClaw 分析失败")
+    results = response.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("OpenClaw 返回缺少 results 数组")
+
+    indexed = {str(x.get("work_id") or ""): x for x in items}
+    mapped: Dict[str, Dict[str, str]] = {}
+    for item in results:
+        work_id = str((item or {}).get("work_id") or "")
+        if not work_id:
+            continue
+        opinion_key = normalize_opinion_key(str((item or {}).get("opinion_key") or "中性")) or "中性"
+        fallback = indexed.get(work_id) or {}
+        mapped[work_id] = {
+            "opinion_key": opinion_key,
+            "opinion_direction": str((item or {}).get("opinion_direction") or "").strip() or str(fallback.get("brand_hint") or "未识别品牌"),
+            "reason": clean_text((item or {}).get("reason") or ""),
+            "opinion_think": clean_text((item or {}).get("opinion_think") or ""),
+        }
+    return mapped
+
+
+def collect_analysis_material(item: dict, criteria: ProjectCriteria) -> dict:
+    title = clean_text(item.get("title") or item.get("desc") or "")
+    content = clean_text(item.get("content") or item.get("desc") or "")
+    full_text = f"{title} {content}".strip().lower()
+    brand_hint = "未识别品牌"
+    for b in criteria.own_brands + criteria.competing_brands:
+        token = clean_text(b)
+        if token and token.lower() in full_text:
+            brand_hint = token
+            break
+    media_summary = extract_media_summary([], content=title or content)
+    return {
+        "work_id": str(item.get("workId") or item.get("work_id") or ""),
+        "title": title,
+        "content": content,
+        "media_summary": media_summary,
+        "brand_hint": brand_hint,
+        "brand_type_hint": "未识别品牌" if brand_hint == "未识别品牌" else "主体",
+    }
+
+
+def extract_analysis_from_task_item(item: dict) -> Optional[Dict[str, str]]:
+    candidates: List[dict] = [item]
+    for key in ["analysis", "opinion", "sentiment", "opinion_result", "analysis_result"]:
+        value = item.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+
+    def pick(keys: List[str]) -> str:
+        for data in candidates:
+            for key in keys:
+                value = data.get(key)
+                if isinstance(value, str) and clean_text(value):
+                    return clean_text(value)
+        return ""
+
+    opinion_key = normalize_opinion_key(pick(["opinion_key", "opinionKey", "opinion", "sentiment", "emotion", "label"]))
+    if not opinion_key:
+        return None
+
+    opinion_direction = pick(["opinion_direction", "opinionDirection", "brand", "brand_name", "brandName", "subject", "target"]) or "未识别品牌"
+    reason = pick(["reason", "opinion_reason", "summary", "analysis_reason"])
+    opinion_think = pick(["opinion_think", "opinionThink", "think", "analysis", "analysis_think", "judgement"])
+    if not reason:
+        reason = f"由定时任务 Agent 分析判定为{opinion_key}。"
+
+    return {
+        "opinion_key": opinion_key,
+        "opinion_direction": opinion_direction,
+        "reason": reason,
+        "opinion_think": opinion_think,
+    }
+
+
+def process_task_items(task_data: dict, project: dict) -> Dict[str, int]:
+    criteria = ProjectCriteria(project)
+    raw_data = task_data.get("raw_data") or {}
+    all_items = raw_data.get("items") or []
+    items = list(all_items)[:MAX_WORKS_PER_TASK]
+    stats = {"total": 0, "positive": 0, "negative": 0, "neutral": 0, "uploaded": 0, "failed": 0}
+
+    print(f"\n📊 开始处理项目「{criteria.project_name}」的 {len(items)} 条数据")
+    if len(all_items) > len(items):
+        print(f"   ⚡ 任务返回 {len(all_items)} 条，已按快速模式截断为前 {len(items)} 条处理")
+    prepared_items: List[Tuple[int, dict, str]] = []
+    seen_work_ids: set[str] = set()
+    for index, item in enumerate(items, start=1):
+        work_id = str(item.get("workId") or item.get("work_id") or "").strip()
+        if not work_id or work_id in seen_work_ids:
+            continue
+        seen_work_ids.add(work_id)
+        prepared_items.append((index, item, work_id))
+
+    existing_list = list_opinions(str(project.get("id")), [entry[2] for entry in prepared_items])
+    existing_by_work_id: Dict[str, dict] = {
+        str(op.get("work_id") or ""): op for op in existing_list if str(op.get("work_id") or "")
+    }
+
+    for index, item, current_work_id in prepared_items:
+        stats["total"] += 1
+        if not current_work_id:
+            stats["failed"] += 1
+            print(f"  [{index}] ❌ 缺少 work_id，跳过上传")
+            continue
+
+        existed = existing_by_work_id.get(current_work_id)
+        if existed:
+            existed_key = normalize_opinion_key(str(existed.get("opinion_key") or ""))
+            if existed_key == "正面":
+                stats["positive"] += 1
+            elif existed_key == "负面":
+                stats["negative"] += 1
+            else:
+                stats["neutral"] += 1
+            stats["uploaded"] += 1
+            print(f"  [{index}] ↪ 已有舆情记录，跳过上传 | work_id={current_work_id}")
+            continue
+
+        analysis = extract_analysis_from_task_item(item)
+        if not analysis:
+            stats["failed"] += 1
+            print(f"  [{index}] ⏳ 缺少分析结果，等待定时任务 Agent 分析 | work_id={current_work_id}")
+            continue
+
+        if analysis["opinion_key"] == "正面":
+            stats["positive"] += 1
+        elif analysis["opinion_key"] == "负面":
+            stats["negative"] += 1
+        else:
+            stats["neutral"] += 1
+
+        success = upload_opinion(str(project.get("id")), current_work_id, analysis)
+        title = str(item.get("title") or item.get("desc") or "")
+        if success:
+            stats["uploaded"] += 1
+            print(f"  [{index}] ✅ {analysis['opinion_key']} | {title[:28]}")
+        else:
+            stats["failed"] += 1
+            print(f"  [{index}] ❌ 上传失败 | {title[:28]}")
+    return stats
+
+
+def resolve_target_projects(project_ids_text: Optional[str] = None) -> List[dict]:
+    projects = get_project_list()
+    if not projects:
+        return []
+    target_ids = parse_csv_ids(project_ids_text or CONFIGURED_PROJECT_IDS)
+    if not target_ids:
+        return projects
+    return [item for item in projects if str(item.get("id")) in target_ids]
+
+
+def build_search_payload(keywords: str, count: int, xhs: bool = False) -> dict:
+    count = max(1, min(MAX_WORKS_PER_TASK, int(count)))
+    payload = {
+        "keywords": keywords,
+        "count": count,
+        "sorts": ["default", "time_descending"],
+        "timeFilter": "7",
+    }
+    if xhs:
+        payload["noteType"] = 0
+        payload["includeDetails"] = True
+    return payload
+
+
+def execute_dispatch_only(project_ids_text: Optional[str] = None) -> dict:
     print("=" * 70)
-    print(f"  下发任务数: {len(dispatched_tasks)}")
-    print(f"  任务状态: 等待插件执行（状态 0 → 1 → 2）")
-    print(f"  下一步: 等待定时任务处理（运行 --mode process）")
-    
+    print("🚀 舆情监控 - 任务下发模式")
+    print("=" * 70)
+    projects = resolve_target_projects(project_ids_text)
+    if not projects:
+        return {"code": 7, "msg": "未获取到可执行的舆情项目"}
+
+    queue = load_queue()
+    now_ts = int(time.time())
+    entries: List[dict] = []
+    for project in projects:
+        project_id = str(project.get("id"))
+        project_name = project.get("project_name") or project.get("name") or project_id
+        keywords = ",".join(parse_terms(project.get("search_key_list") or ""))
+        if not keywords:
+            print(f"⚠️  项目「{project_name}」未配置项目搜索词，跳过")
+            continue
+
+        print(f"\n📋 项目：{project_name} ({project_id})")
+        print(f"   搜索词：{keywords}")
+
+        if ENABLE_DY:
+            if has_recent_active_task(queue, project_id, "douyin", now_ts):
+                print("   ⏭️  抖音已有进行中任务，跳过重复下发")
+            elif has_recent_risk_control_failure(queue, project_id, "douyin", now_ts):
+                print(f"   ⏭️  抖音近期风控，冷却 {RISK_CONTROL_COOLDOWN_SECONDS}s 内跳过下发")
+            else:
+                dy_task_id = dispatch_plugin_task("meiyali-plugin-dy", "dy.search", build_search_payload(keywords, DY_SEARCH_COUNT))
+                if dy_task_id:
+                    entries.append({
+                        "task_id": dy_task_id,
+                        "platform": "douyin",
+                        "work_project_id": project_id,
+                        "project_name": project_name,
+                        "status": "waiting_result",
+                        "queued_at": int(time.time()),
+                        "last_task_status": 0,
+                        "result_query_failures": 0,
+                    })
+                    print(f"   ✅ 抖音任务已下发: {dy_task_id[:10]}...")
+        else:
+            print("   ⏭️  抖音下发已关闭（OPENCLAW_ENABLE_DY=0）")
+
+        if ENABLE_XHS:
+            if has_recent_active_task(queue, project_id, "xiaohongshu", now_ts):
+                print("   ⏭️  小红书已有进行中任务，跳过重复下发")
+            elif has_recent_risk_control_failure(queue, project_id, "xiaohongshu", now_ts):
+                print(f"   ⏭️  小红书近期风控，冷却 {RISK_CONTROL_COOLDOWN_SECONDS}s 内跳过下发")
+            else:
+                xhs_task_id = dispatch_plugin_task("meiyali-plugin-xhs", "xhs.search", build_search_payload(keywords, XHS_SEARCH_COUNT, xhs=True))
+                if xhs_task_id:
+                    entries.append({
+                        "task_id": xhs_task_id,
+                        "platform": "xiaohongshu",
+                        "work_project_id": project_id,
+                        "project_name": project_name,
+                        "status": "waiting_result",
+                        "queued_at": int(time.time()),
+                        "last_task_status": 0,
+                        "result_query_failures": 0,
+                    })
+                    print(f"   ✅ 小红书任务已下发: {xhs_task_id[:10]}...")
+        else:
+            print("   ⏭️  小红书下发已关闭（OPENCLAW_ENABLE_XHS=0）")
+
+    if entries:
+        upsert_queue_entries(entries)
+
     return {
         "code": 0,
         "data": {
-            "project_id": project_id,
-            "scene_id": scene_id,
-            "dispatched_tasks": dispatched_tasks,
-            "task_count": len(dispatched_tasks),
-            "mode": "dispatch_only"
+            "project_count": len(projects),
+            "task_count": len(entries),
+            "projects": [str(item.get("id")) for item in projects],
+            "mode": "dispatch",
         },
-        "msg": "成功"
+        "msg": "成功" if entries else "没有可下发任务；等待定时 process 执行，不要前台运行 process",
     }
 
-def execute_process_only(project_id: int = None) -> dict:
-    """Part B: 仅处理已完成任务（查询状态为 2 的任务并处理）
-    
-    适用于分离模式的结果处理阶段。
-    任务状态流转：2（执行成功）→ 3（任务结束）
-    
-    Returns:
-        处理结果统计
-    """
+
+def execute_process_only(project_ids_text: Optional[str] = None) -> dict:
     print("=" * 70)
-    print("🚀 舆情监控 - 任务处理模式（Part B）")
+    print("🚀 舆情监控 - 任务处理模式")
     print("=" * 70)
-    
-    print(f"\n📋 查询状态为 2（执行成功）的任务...")
-    tasks = get_completed_tasks(project_id)
-    
-    if not tasks:
-        print("✅ 没有待处理的任务")
+    queue = load_queue()
+    if not queue:
+        return {"code": 0, "data": {"processed_tasks": 0}, "msg": "任务队列为空"}
+
+    allowed_ids = set(parse_csv_ids(project_ids_text or CONFIGURED_PROJECT_IDS))
+    project_index = {str(item.get("id")): item for item in get_project_list()}
+    summary = {"total": 0, "positive": 0, "negative": 0, "neutral": 0, "uploaded": 0, "failed": 0}
+    finished_task_ids: List[str] = []
+    handled_tasks = 0
+
+    for task in sorted(queue, key=lambda x: int(x.get("queued_at") or 0), reverse=True):
+        status = str(task.get("status") or "")
+        if status == "finished" or status.startswith("failed_"):
+            continue
+        project_id = str(task.get("work_project_id") or "")
+        if allowed_ids and project_id not in allowed_ids:
+            continue
+
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        print(f"\n⏳ 检查任务: {task_id[:10]}... ({task.get('platform')})")
+        task_result = get_task_result_response(task_id)
+        if not task_result:
+            failed_count = int(task.get("result_query_failures") or 0) + 1
+            task["result_query_failures"] = failed_count
+            if failed_count >= TASK_RESULT_FAIL_MAX:
+                task["status"] = "failed_result_query"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = f"task/result 连续失败 {failed_count} 次"
+                print(f"   ❌ 查询 task/result 连续失败 {failed_count} 次，标记失败")
+                handled_tasks += 1
+                if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                    break
+            continue
+
+        try:
+            task_code = int(task_result.get("code") or 0)
+        except Exception:
+            task_code = -999
+        if task_code == 7:
+            task["status"] = "failed_task_not_found"
+            task["failed_at"] = int(time.time())
+            task["failed_reason"] = f"task/result 查询失败: {task_result.get('msg') or '任务不存在'}"
+            task["result_query_failures"] = int(task.get("result_query_failures") or 0) + 1
+            print(f"   ❌ task/result 返回 code=7，任务已失效，标记失败并跳过")
+            handled_tasks += 1
+            if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                break
+            continue
+
+        if task_code != 0:
+            failed_count = int(task.get("result_query_failures") or 0) + 1
+            task["result_query_failures"] = failed_count
+            print(f"   ⚠️ task/result 异常 code={task_code} msg={task_result.get('msg')}")
+            if failed_count >= TASK_RESULT_FAIL_MAX:
+                task["status"] = "failed_result_query"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = f"task/result 异常 code={task_code}"
+                handled_tasks += 1
+                if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                    break
+            continue
+
+        task_data = task_result.get("data") or {}
+        task_error_text = get_task_error_text(task_result, task_data)
+
+        task_status = int(task_data.get("task_status") or 0)
+        task["last_task_status"] = task_status
+        task["result_query_failures"] = 0
+        if task_status == 3:
+            task["status"] = "finished"
+            task["finished_at"] = int(time.time())
+            finished_task_ids.append(task_id)
+            print("   ✅ 远端已结束(task_status=3)，本地直接收口")
+            handled_tasks += 1
+            if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                break
+            continue
+        if task_status in (-1, -2):
+            task["status"] = "failed_task_status"
+            task["failed_at"] = int(time.time())
+            task["failed_reason"] = f"上游任务状态异常: {task_status}"
+            print(f"   ❌ 上游任务失败，task_status={task_status}，标记失败")
+            handled_tasks += 1
+            if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                break
+            continue
+        if task_status == 1:
+            if is_risk_control_text(task_error_text):
+                task["status"] = "failed_risk_control"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = trim_text(task_error_text, 200) or "平台风控或登录态受限"
+                finish_tasks([task_id])
+                print(f"   ❌ 检测到平台风控，快速失败并进入冷却: {task['failed_reason']}")
+                handled_tasks += 1
+                if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                    break
+                continue
+            queued_at = int(task.get("queued_at") or 0)
+            wait_seconds = int(time.time()) - queued_at if queued_at else 0
+            if queued_at and wait_seconds >= TASK_STATUS_PENDING_TIMEOUT_SECONDS:
+                task["status"] = "failed_task_timeout"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = f"任务长时间处理中超时: {wait_seconds}s"
+                finish_tasks([task_id])
+                print(f"   ❌ 任务长时间处于处理中(task_status=1, {wait_seconds}s)，标记超时失败")
+                continue
+            print(f"   当前状态: {task_status}，继续等待")
+            continue
+        if task_status not in (2, 3):
+            print(f"   当前状态: {task_status}，继续等待")
+            continue
+
+        raw_items = ((task_data.get("raw_data") or {}).get("items") or [])
+        if raw_items:
+            preview: List[dict] = []
+            preview_seen: set[str] = set()
+            for raw_item in raw_items:
+                preview_work_id = str(raw_item.get("workId") or raw_item.get("work_id") or "").strip()
+                if not preview_work_id or preview_work_id in preview_seen:
+                    continue
+                preview_seen.add(preview_work_id)
+                preview.append({
+                    "work_id": preview_work_id,
+                    "title": clean_text(raw_item.get("title") or raw_item.get("desc") or ""),
+                    "content": clean_text(raw_item.get("content") or raw_item.get("desc") or ""),
+                })
+                if len(preview) >= CHAT_WORK_IDS_PER_TASK:
+                    break
+            task["last_items_preview"] = preview
+            task["last_item_count"] = len(raw_items)
+        else:
+            cached_preview = task.get("last_items_preview")
+            cached_items: List[dict] = []
+            if isinstance(cached_preview, list) and cached_preview:
+                for preview in cached_preview:
+                    preview_work_id = str((preview or {}).get("work_id") or "").strip()
+                    if not preview_work_id:
+                        continue
+                    cached_items.append({
+                        "workId": preview_work_id,
+                        "title": clean_text((preview or {}).get("title") or ""),
+                        "content": clean_text((preview or {}).get("content") or ""),
+                    })
+                    if len(cached_items) >= MAX_WORKS_PER_TASK:
+                        break
+            if cached_items:
+                print(f"   ⚡ task/result items=0，改用 last_items_preview 缓存 {len(cached_items)} 条继续处理")
+                raw_items = cached_items
+                task_data = dict(task_data)
+                raw_data_obj = dict(task_data.get("raw_data") or {})
+                raw_data_obj["items"] = raw_items
+                task_data["raw_data"] = raw_data_obj
+
+        if task_status == 2 and not raw_items:
+            if is_risk_control_text(task_error_text):
+                task["status"] = "failed_risk_control"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = trim_text(task_error_text, 200) or "平台风控导致无结果"
+                finish_tasks([task_id])
+                print(f"   ❌ 任务无结果且疑似风控，快速失败并冷却: {task['failed_reason']}")
+            else:
+                print("   ⚡ 任务无可处理作品(items=0)，直接标记完成")
+                if finish_tasks([task_id]):
+                    task["status"] = "finished"
+                    task["finished_at"] = int(time.time())
+                    finished_task_ids.append(task_id)
+                    print("   ✅ 已标记任务完成")
+            handled_tasks += 1
+            if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+                break
+            continue
+
+        project = project_index.get(project_id) or get_project_config(project_id)
+        if not project:
+            print(f"   ⚠️  项目 {project_id} 不存在，跳过")
+            continue
+
+        stats = process_task_items(task_data, project)
+        for key in summary:
+            summary[key] += stats.get(key, 0)
+
+        if (stats["total"] == 0) or (stats["failed"] == 0 and stats["uploaded"] == stats["total"]):
+            if finish_tasks([task_id]):
+                task["status"] = "finished"
+                task["finished_at"] = int(time.time())
+                finished_task_ids.append(task_id)
+                print(f"   ✅ 已标记任务完成")
+        handled_tasks += 1
+        if handled_tasks >= PROCESS_MAX_TASKS_PER_RUN:
+            break
+
+    save_queue(queue)
+    return {
+        "code": 0,
+        "data": {
+            "processed_tasks": len(finished_task_ids),
+            "summary": summary,
+            "finished_task_ids": finished_task_ids,
+            "mode": "process",
+        },
+        "msg": "成功",
+    }
+
+
+def execute_analyze_only(project_ids_text: Optional[str] = None) -> dict:
+    print("=" * 70)
+    print("🚀 舆情监控 - 独立分析模式")
+    print("=" * 70)
+    queue = load_queue()
+    if not queue:
+        return {"code": 0, "data": {"analyzed": 0}, "msg": "任务队列为空"}
+
+    allowed_ids = set(parse_csv_ids(project_ids_text or CONFIGURED_PROJECT_IDS))
+    project_index = {str(item.get("id")): item for item in get_project_list()}
+    analyzed = 0
+    uploaded = 0
+    failed = 0
+    handled_tasks = 0
+
+    for task in sorted(queue, key=lambda x: int(x.get("queued_at") or 0), reverse=True):
+        if analyzed >= ANALYZE_MAX_ITEMS_PER_RUN or handled_tasks >= ANALYZE_MAX_TASKS_PER_RUN:
+            break
+        status = str(task.get("status") or "")
+        if status == "finished" or status.startswith("failed_"):
+            continue
+
+        project_id = str(task.get("work_project_id") or "")
+        if allowed_ids and project_id not in allowed_ids:
+            continue
+
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        task_result = get_task_result_response(task_id)
+        if not task_result or int(task_result.get("code") or 0) != 0:
+            continue
+        task_data = task_result.get("data") or {}
+        if int(task_data.get("task_status") or 0) not in (2, 3):
+            continue
+
+        raw_items = ((task_data.get("raw_data") or {}).get("items") or [])
+        if not raw_items:
+            continue
+
+        project = project_index.get(project_id) or get_project_config(project_id)
+        if not project:
+            continue
+        criteria = ProjectCriteria(project)
+
+        unique_items: List[dict] = []
+        seen_ids = set()
+        for item in raw_items:
+            wid = str(item.get("workId") or item.get("work_id") or "").strip()
+            if not wid or wid in seen_ids:
+                continue
+            seen_ids.add(wid)
+            unique_items.append(item)
+            if len(unique_items) >= MAX_WORKS_PER_TASK:
+                break
+
+        existing = list_opinions(project_id, [str(x.get("workId") or x.get("work_id") or "") for x in unique_items])
+        existing_ids = {str(x.get("work_id") or "") for x in existing if str(x.get("work_id") or "")}
+        pending: List[dict] = []
+        for item in unique_items:
+            wid = str(item.get("workId") or item.get("work_id") or "").strip()
+            if not wid or wid in existing_ids:
+                continue
+            pending.append(collect_analysis_material(item, criteria))
+            if analyzed + len(pending) >= ANALYZE_MAX_ITEMS_PER_RUN:
+                break
+        if not pending:
+            handled_tasks += 1
+            continue
+
+        print(f"\n🧠 分析任务 {task_id[:10]}... 待分析 {len(pending)} 条")
+        for i in range(0, len(pending), ANALYZE_BATCH_SIZE):
+            batch = pending[i : i + ANALYZE_BATCH_SIZE]
+            try:
+                result_map = analyze_sentiment_batch(batch, criteria)
+            except Exception as err:
+                print(f"   ❌ 分析失败: {err}")
+                failed += len(batch)
+                continue
+
+            for row in batch:
+                wid = str(row.get("work_id") or "")
+                if not wid:
+                    continue
+                analysis = result_map.get(wid)
+                if not analysis:
+                    failed += 1
+                    continue
+                if upload_opinion(project_id, wid, analysis):
+                    uploaded += 1
+                else:
+                    failed += 1
+                analyzed += 1
+                if analyzed >= ANALYZE_MAX_ITEMS_PER_RUN:
+                    break
+            if analyzed >= ANALYZE_MAX_ITEMS_PER_RUN:
+                break
+        handled_tasks += 1
+
+    return {
+        "code": 0,
+        "data": {
+            "mode": "analyze",
+            "analyzed": analyzed,
+            "uploaded": uploaded,
+            "failed": failed,
+            "handled_tasks": handled_tasks,
+        },
+        "msg": "成功",
+    }
+
+
+def execute_chat_only(project_ids_text: Optional[str] = None) -> dict:
+    print("=" * 70)
+    print("🚀 舆情监控 - 对话快速模式")
+    print("=" * 70)
+    queue = load_queue()
+
+    allowed_ids = set(parse_csv_ids(project_ids_text or CONFIGURED_PROJECT_IDS))
+    if CHAT_AUTO_DISPATCH:
+        dispatch_projects = resolve_target_projects(project_ids_text)
+        now_ts = int(time.time())
+        new_entries: List[dict] = []
+        if dispatch_projects:
+            print("⚡ 对话模式触发一次最新任务下发（不阻塞当前回复）")
+        for project in dispatch_projects:
+            project_id = str(project.get("id") or "")
+            if allowed_ids and project_id not in allowed_ids:
+                continue
+            project_name = project.get("project_name") or project.get("name") or project_id
+            keywords = ",".join(parse_terms(project.get("search_key_list") or ""))
+            if not keywords:
+                continue
+
+            if ENABLE_DY:
+                if has_recent_active_task(queue, project_id, "douyin", now_ts):
+                    print("   ⏭️  chat 跳过抖音：已有进行中任务")
+                elif has_recent_risk_control_failure(queue, project_id, "douyin", now_ts):
+                    print("   ⏭️  chat 跳过抖音：近期风控冷却中")
+                else:
+                    dy_task_id = dispatch_plugin_task(
+                        "meiyali-plugin-dy",
+                        "dy.search",
+                        build_search_payload(keywords, DY_SEARCH_COUNT),
+                        timeout_seconds=CHAT_DISPATCH_TIMEOUT_SECONDS,
+                        retry_count=CHAT_DISPATCH_RETRY_COUNT,
+                    )
+                    if dy_task_id:
+                        new_entries.append({
+                            "task_id": dy_task_id,
+                            "platform": "douyin",
+                            "work_project_id": project_id,
+                            "project_name": project_name,
+                            "status": "waiting_result",
+                            "queued_at": now_ts,
+                            "last_task_status": 0,
+                            "result_query_failures": 0,
+                        })
+                        print(f"   ✅ chat 下发抖音任务: {dy_task_id[:10]}...")
+
+            if ENABLE_XHS:
+                if has_recent_active_task(queue, project_id, "xiaohongshu", now_ts):
+                    print("   ⏭️  chat 跳过小红书：已有进行中任务")
+                elif has_recent_risk_control_failure(queue, project_id, "xiaohongshu", now_ts):
+                    print("   ⏭️  chat 跳过小红书：近期风控冷却中")
+                else:
+                    xhs_task_id = dispatch_plugin_task(
+                        "meiyali-plugin-xhs",
+                        "xhs.search",
+                        build_search_payload(keywords, XHS_SEARCH_COUNT, xhs=True),
+                        timeout_seconds=CHAT_DISPATCH_TIMEOUT_SECONDS,
+                        retry_count=CHAT_DISPATCH_RETRY_COUNT,
+                    )
+                    if xhs_task_id:
+                        new_entries.append({
+                            "task_id": xhs_task_id,
+                            "platform": "xiaohongshu",
+                            "work_project_id": project_id,
+                            "project_name": project_name,
+                            "status": "waiting_result",
+                            "queued_at": now_ts,
+                            "last_task_status": 0,
+                            "result_query_failures": 0,
+                        })
+                        print(f"   ✅ chat 下发小红书任务: {xhs_task_id[:10]}...")
+        if new_entries:
+            upsert_queue_entries(new_entries)
+            queue = load_queue()
+
+    if not queue:
+        return {"code": 7, "msg": "暂无任务队列，可先等待定时 dispatch/process 产出数据"}
+
+    rows: List[dict] = []
+    seen_work_ids = set()
+    source_task_ids: List[str] = []
+    scanned_tasks = 0
+    checked_tasks = 0
+    queue_dirty = False
+    max_checked_tasks = max(CHAT_SAMPLE_SIZE + 2, CHAT_MAX_TASKS_SCAN * 4)
+    for task in sorted(queue, key=lambda x: int(x.get("queued_at") or 0), reverse=True):
+        if len(rows) >= CHAT_SAMPLE_SIZE or checked_tasks >= max_checked_tasks:
+            break
+        checked_tasks += 1
+        project_id = str(task.get("work_project_id") or "")
+        if allowed_ids and project_id not in allowed_ids:
+            continue
+
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+
+        item_index: Dict[str, dict] = {}
+        work_ids: List[str] = []
+        cached_preview = task.get("last_items_preview")
+        if isinstance(cached_preview, list) and cached_preview:
+            for preview in cached_preview:
+                wid = str((preview or {}).get("work_id") or "").strip()
+                if not wid or wid in item_index:
+                    continue
+                item_index[wid] = {
+                    "title": clean_text((preview or {}).get("title") or ""),
+                    "content": clean_text((preview or {}).get("content") or ""),
+                }
+                work_ids.append(wid)
+                if len(work_ids) >= CHAT_WORK_IDS_PER_TASK:
+                    break
+        else:
+            if scanned_tasks >= CHAT_MAX_TASKS_SCAN:
+                continue
+            scanned_tasks += 1
+            task_result = get_task_result_response(
+                task_id,
+                timeout_seconds=CHAT_TASK_RESULT_TIMEOUT_SECONDS,
+                retry_count=CHAT_API_RETRY_COUNT,
+            )
+            if not task_result:
+                continue
+
+            try:
+                task_code = int(task_result.get("code") or 0)
+            except Exception:
+                task_code = -999
+            if task_code == 7:
+                task["status"] = "failed_task_not_found"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = f"chat 查询 task/result 失败: {task_result.get('msg') or '任务不存在'}"
+                queue_dirty = True
+                continue
+            if task_code != 0:
+                continue
+
+            task_data = task_result.get("data") or {}
+            task_status = int(task_data.get("task_status") or 0)
+            task_error_text = get_task_error_text(task_result, task_data)
+            task["last_task_status"] = task_status
+            if task_status == 1 and is_risk_control_text(task_error_text):
+                task["status"] = "failed_risk_control"
+                task["failed_at"] = int(time.time())
+                task["failed_reason"] = trim_text(task_error_text, 200) or "平台风控或登录态受限"
+                queue_dirty = True
+                continue
+            if task_status not in (2, 3):
+                continue
+
+            raw_items = ((task_data.get("raw_data") or {}).get("items") or [])
+            if not raw_items:
+                if is_risk_control_text(task_error_text):
+                    task["status"] = "failed_risk_control"
+                    task["failed_at"] = int(time.time())
+                    task["failed_reason"] = trim_text(task_error_text, 200) or "平台风控导致无结果"
+                    queue_dirty = True
+                    continue
+                cached_items: List[dict] = []
+                task_cached_preview = task.get("last_items_preview")
+                if isinstance(task_cached_preview, list) and task_cached_preview:
+                    for preview in task_cached_preview:
+                        preview_work_id = str((preview or {}).get("work_id") or "").strip()
+                        if not preview_work_id:
+                            continue
+                        cached_items.append({
+                            "workId": preview_work_id,
+                            "title": clean_text((preview or {}).get("title") or ""),
+                            "content": clean_text((preview or {}).get("content") or ""),
+                        })
+                        if len(cached_items) >= CHAT_WORK_IDS_PER_TASK:
+                            break
+                if not cached_items:
+                    continue
+                raw_items = cached_items
+
+            preview: List[dict] = []
+            preview_seen: set[str] = set()
+            for raw_item in raw_items:
+                preview_work_id = str(raw_item.get("workId") or raw_item.get("work_id") or "").strip()
+                if not preview_work_id or preview_work_id in preview_seen:
+                    continue
+                preview_seen.add(preview_work_id)
+                preview.append({
+                    "work_id": preview_work_id,
+                    "title": clean_text(raw_item.get("title") or raw_item.get("desc") or ""),
+                    "content": clean_text(raw_item.get("content") or raw_item.get("desc") or ""),
+                })
+                if len(preview) >= CHAT_WORK_IDS_PER_TASK:
+                    break
+            if preview:
+                task["last_items_preview"] = preview
+                queue_dirty = True
+
+            for item in raw_items:
+                wid = str(item.get("workId") or item.get("work_id") or "")
+                if not wid or wid in item_index:
+                    continue
+                item_index[wid] = {
+                    "title": clean_text(item.get("title") or item.get("desc") or ""),
+                    "content": clean_text(item.get("content") or item.get("desc") or ""),
+                }
+                work_ids.append(wid)
+                if len(work_ids) >= CHAT_WORK_IDS_PER_TASK:
+                    break
+
+        opinions = list_opinions(project_id, work_ids)
+        if not opinions:
+            continue
+
+        source_task_ids.append(task_id)
+        for op in opinions:
+            wid = str(op.get("work_id") or "")
+            if not wid or wid in seen_work_ids:
+                continue
+            src = item_index.get(wid) or {}
+            rows.append({
+                "work_id": wid,
+                "title": clean_text(src.get("title") or src.get("content") or ""),
+                "opinion_key": str(op.get("opinion_key") or ""),
+                "opinion_direction": str(op.get("opinion_direction") or ""),
+                "reason": clean_text(op.get("reason") or ""),
+                "updated_at": op.get("updated_at"),
+                "platform": task.get("platform"),
+                "project_id": project_id,
+                "project_name": task.get("project_name"),
+            })
+            seen_work_ids.add(wid)
+            if len(rows) >= CHAT_SAMPLE_SIZE:
+                break
+
+    if queue_dirty:
+        save_queue(queue)
+
+    if rows:
         return {
             "code": 0,
             "data": {
-                "total_tasks": 0,
-                "processed_tasks": 0,
-                "mode": "process_only"
+                "mode": "chat",
+                "source_task_ids": source_task_ids[:8],
+                "sample_size": len(rows),
+                "items": rows,
             },
-            "msg": "没有待处理任务"
+            "msg": "成功（仅展示最新3-5条，完整处理由定时任务执行）",
         }
-    
-    print(f"✅ 发现 {len(tasks)} 个待处理任务\n")
-    
-    all_stats = {"total": 0, "positive": 0, "negative": 0, "neutral": 0, "warning": 0, "uploaded": 0, "failed": 0}
-    processed_task_ids = []
-    
-    for idx, task in enumerate(tasks):
-        task_id = task.get('task_id')
-        task_project_id = task.get('work_project_id', project_id)
-        task_scene_id = task.get('scene_id')
-        
-        print(f"\n[{idx+1}/{len(tasks)}] 处理任务: {task_id[:10]}...")
-        
-        # 获取项目和场景配置
-        if not task_project_id or not task_scene_id:
-            print(f"  ⚠️  任务缺少项目或场景 ID，跳过")
-            continue
-        
-        task_data = poll_task_result(task_id)
-        
-        if task_data:
-            # 获取场景配置以解析舆情标准
-            scene = get_scene_detail(task_scene_id)
-            if not scene:
-                print(f"  ⚠️  场景不存在，跳过")
-                continue
-            
-            criteria = OpinionCriteriaParser(scene.get('description', ''))
-            
-            stats = process_task_items(task_data, task_project_id, task_scene_id, criteria)
-            
-            for key in all_stats:
-                all_stats[key] += stats.get(key, 0)
-            
-            if stats['total'] > 0 and stats['failed'] == 0 and stats['total'] == stats['uploaded']:
-                processed_task_ids.append(task_id)
-    
-    # 批量标记任务完成
-    if processed_task_ids:
-        print(f"\n🏁 标记 {len(processed_task_ids)} 个任务为完成状态...")
-        finish_tasks(processed_task_ids)
-    
-    print("\n" + "=" * 70)
-    print("📊 任务处理完成")
-    print("=" * 70)
-    print(f"  处理任务数: {len(tasks)}")
-    print(f"  成功任务数: {len(processed_task_ids)}")
-    print(f"  总数据:    {all_stats['total']} 条")
-    print(f"  正向:     {all_stats['positive']} 条")
-    print(f"  中性:     {all_stats['neutral']} 条")
-    print(f"  负向:     {all_stats['negative']} 条")
-    print(f"  预警:     {all_stats['warning']} 条")
-    print(f"  上传成功:  {all_stats['uploaded']} 条")
-    print(f"  上传失败:  {all_stats['failed']} 条")
-    
+
+    return {"code": 7, "msg": "暂无可展示的舆情结果，请等待定时任务完成后再试"}
+
+
+def execute_full_workflow(project_ids_text: Optional[str] = None) -> dict:
+    dispatch_result = execute_dispatch_only(project_ids_text)
+    time.sleep(2)
+    analyze_result = execute_analyze_only(project_ids_text)
+    time.sleep(1)
+    process_result = execute_process_only(project_ids_text)
     return {
         "code": 0,
         "data": {
-            "total_tasks": len(tasks),
-            "processed_tasks": len(processed_task_ids),
-            "summary": all_stats,
-            "finished_task_ids": processed_task_ids,
-            "mode": "process_only"
+            "dispatch": dispatch_result.get("data") or {},
+            "analyze": analyze_result.get("data") or {},
+            "process": process_result.get("data") or {},
+            "mode": "full",
         },
-        "msg": "成功"
+        "msg": "成功",
     }
 
-def main():
-    """主函数 - 支持多种执行模式"""
-    parser = argparse.ArgumentParser(description='舆情监控统一工作流脚本')
-    parser.add_argument('project_id', type=int, nargs='?', help='项目 ID')
-    parser.add_argument('scene_id', type=int, nargs='?', help='场景 ID')
-    parser.add_argument('--mode', '-m', choices=['full', 'dispatch', 'process'], 
-                       default='full', help='执行模式: full(完整流程), dispatch(仅下发), process(仅处理)')
-    
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="舆情监控统一工作流脚本（项目级）")
+    parser.add_argument("project_ids", nargs="?", help="项目 ID 列表，多个用英文逗号分隔")
+    parser.add_argument(
+        "--mode",
+        "-m",
+        choices=["chat", "full", "dispatch", "analyze", "process"],
+        default="chat",
+        help="默认 chat（快速展示3-5条）；需要下发/分析/处理时显式使用 --mode dispatch/--mode analyze/--mode process",
+    )
     args = parser.parse_args()
-    
-    if args.mode == 'full':
-        # 完整流程（默认）
-        result = execute_full_workflow(args.project_id, args.scene_id)
-    elif args.mode == 'dispatch':
-        # Part A: 仅下发任务
-        result = execute_dispatch_only(args.project_id, args.scene_id)
-    elif args.mode == 'process':
-        # Part B: 仅处理任务
-        result = execute_process_only(args.project_id)
-    
-    print(f"\n{json.dumps(result, ensure_ascii=False, indent=2)}")
+
+    if args.mode == "chat":
+        result = execute_chat_only(args.project_ids)
+    elif args.mode == "dispatch":
+        result = execute_dispatch_only(args.project_ids)
+    elif args.mode == "analyze":
+        result = execute_analyze_only(args.project_ids)
+    elif args.mode == "process":
+        result = execute_process_only(args.project_ids)
+    else:
+        result = execute_full_workflow(args.project_ids)
+
+    print("\n" + json.dumps(result, ensure_ascii=False, indent=2))
+
 
 if __name__ == "__main__":
     main()
