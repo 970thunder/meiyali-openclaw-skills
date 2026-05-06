@@ -1,267 +1,80 @@
-# 项目配置 API 文档
+# Relay 项目配置 API
 
 ## 认证
 
-请求头：`api-key: <用户ApiKey>`
+请求头：`X-OpenClaw-API-Key: <relay_api_key>`
 
-## 项目操作
+## 项目管理
 
-### 获取项目
+### 获取项目列表
 
-**端点**: `GET /openclaw/project/find?id={projectId}`
-
-**响应**:
-```json
-{
-  "code": 0,
-  "data": {
-    "id": 30001,
-    "project_name": "猫粮舆情监控",
-    "brand_description": "XX品牌猫粮",
-    "brand_tags_description": "宠物/猫粮/口碑",
-    "competing_brand_description": "YY品牌，ZZ品牌",
-    "yunfan_id": 123,
-    "search_key_list": "猫粮,营养餐,宠物食品",
-    "webhook_broadcast_within_days": 7,
-    "webhook_broadcast_configs": [
-      {
-        "config_name": "钉钉多维表格播报",
-        "config_key": "dingding-ai-table",
-        "webhook_url": "https://dingtalk.ai.table/webhook",
-        "secret": "",
-        "enable": true
-      },
-      {
-        "config_name": "钉钉机器人播报",
-        "config_key": "dingding-robot",
-        "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
-        "secret": "ding-secret",
-        "enable": false
-      }
-    ],
-    "opinion_configs": [
-      {
-        "config_name": "负面",
-        "config_key": "负面",
-        "opinion_standard": "负面判断标准",
-        "broadcast_enable": true
-      },
-      {
-        "config_name": "正面",
-        "config_key": "正面",
-        "opinion_standard": "正面判断标准",
-        "broadcast_enable": false
-      },
-      {
-        "config_name": "中性",
-        "config_key": "中性",
-        "opinion_standard": "中性判断标准",
-        "broadcast_enable": false
-      }
-    ],
-    "created_at": "2026-03-01T10:00:00Z",
-    "updated_at": "2026-03-15T08:00:00Z"
-  },
-  "msg": "成功"
-}
+```http
+GET /api/v1/projects
 ```
 
-### 获取列表
+### 获取单个项目
 
-**端点**: `GET /openclaw/project/list`
-
-**参数**:
-- `page` - 页码，默认 1
-- `pageSize` - 每页数量，默认 10
-- `project_name` - 项目名称模糊搜索
-- `brand_description` - 品牌描述模糊搜索
-
-**响应**:
-```json
-{
-  "code": 0,
-  "data": {
-    "list": [
-      {
-        "id": 30001,
-        "project_name": "猫粮舆情监控",
-        "brand_description": "XX品牌猫粮",
-        "competing_brand_description": "YY品牌，ZZ品牌",
-        "brand_tags_description": "宠物/猫粮/口碑",
-        "yunfan_id": 123,
-        "search_key_list": "猫粮,营养餐,宠物食品",
-        "webhook_broadcast_within_days": 7,
-        "webhook_broadcast_configs": [
-          {
-            "config_name": "钉钉多维表格播报",
-            "config_key": "dingding-ai-table",
-            "webhook_url": "https://dingtalk.ai.table/webhook",
-            "secret": "",
-            "enable": true
-          }
-        ],
-        "opinion_configs": [
-          {
-            "config_name": "负面",
-            "config_key": "负面",
-            "opinion_standard": "负面判断标准",
-            "broadcast_enable": true
-          }
-        ],
-        "created_at": "2026-03-01T10:00:00Z",
-        "updated_at": "2026-03-15T08:00:00Z"
-      }
-    ],
-    "total": 1,
-    "page": 1,
-    "pageSize": 10
-  },
-  "msg": "获取成功"
-}
+```http
+GET /api/v1/projects/{project_id}
 ```
 
 ### 创建项目
 
-**端点**: `POST /openclaw/project/create`
-
-**请求体**:
-```json
-{
-  "project_name": "猫粮舆情监控",
-  "brand_description": "XX品牌猫粮",
-  "brand_tags_description": "宠物/猫粮/口碑",
-  "competing_brand_description": "YY品牌，ZZ品牌",
-  "search_key_list": "猫粮,营养餐,宠物食品",
-  "webhook_broadcast_within_days": 7,
-  "webhook_broadcast_configs": [
-    {
-      "config_name": "钉钉多维表格播报",
-      "config_key": "dingding-ai-table",
-      "webhook_url": "https://dingtalk.ai.table/webhook",
-      "secret": "",
-      "enable": true
-    },
-    {
-      "config_name": "钉钉机器人播报",
-      "config_key": "dingding-robot",
-      "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
-      "secret": "ding-secret",
-      "enable": false
-    }
-  ],
-  "opinion_configs": [
-    {
-      "config_name": "负面",
-      "config_key": "负面",
-      "opinion_standard": "负面判断标准",
-      "broadcast_enable": true
-    },
-    {
-      "config_name": "正面",
-      "config_key": "正面",
-      "opinion_standard": "正面判断标准",
-      "broadcast_enable": false
-    },
-    {
-      "config_name": "中性",
-      "config_key": "中性",
-      "opinion_standard": "中性判断标准",
-      "broadcast_enable": false
-    }
-  ]
-}
+```http
+POST /api/v1/projects
+Content-Type: application/json
 ```
 
-**字段说明**:
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `project_name` | string | 项目名称（必填） |
-| `brand_description` | string | 品牌描述 |
-| `brand_tags_description` | string | 品牌标签描述 |
-| `competing_brand_description` | string | 竞品品牌描述 |
-| `search_key_list` | string | 关键词列表，逗号分隔 |
-| `webhook_broadcast_within_days` | number | Webhook 播报时间范围（天数），0 表示不限制 |
-| `webhook_broadcast_configs` | array | Webhook 播报配置数组 |
-| `opinion_configs` | array | 舆情配置数组 |
+示例：
 
-**webhook_broadcast_configs 字段说明**:
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `config_name` | string | 配置名称 |
-| `config_key` | string | 配置唯一标识 |
-| `webhook_url` | string | Webhook 地址 |
-| `secret` | string | 签名密钥（钉钉需要） |
-| `enable` | boolean | 是否启用 |
-
-**opinion_configs 字段说明**:
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `config_name` | string | 配置名称（负面/正面/中性） |
-| `config_key` | string | 配置唯一标识 |
-| `opinion_standard` | string | 舆情判断标准描述 |
-| `broadcast_enable` | boolean | 是否启用播报 |
-
-**说明**:
-- 若会员配置了 `max_project_number` 且已达到上限，创建会失败并返回：`已达到可创建舆情项目上限`
-- `webhook_broadcast_configs` 用于统一配置播报方式，服务端会按 `enable=true` 的配置决定播报渠道
+```json
+{
+  "project_name": "猿辅导舆情监控",
+  "search_key_list": "猿辅导,斑马APP",
+  "opinion_configs_json": [],
+  "webhook_broadcast_configs_json": [],
+  "crawl_config_json": {
+    "platforms": ["dy", "xhs"]
+  },
+  "status": 1
+}
+```
 
 ### 更新项目
 
-**端点**: `PUT /openclaw/project/update`
-
-**请求体**:
-```json
-{
-  "id": 30001,
-  "project_name": "猫粮舆情监控（更新）",
-  "brand_description": "XX品牌猫粮（更新）",
-  "brand_tags_description": "宠物/猫粮/口碑",
-  "competing_brand_description": "YY品牌，ZZ品牌",
-  "search_key_list": "猫粮,营养餐,宠物食品",
-  "webhook_broadcast_within_days": 7,
-  "webhook_broadcast_configs": [
-    {
-      "config_name": "钉钉多维表格播报",
-      "config_key": "dingding-ai-table",
-      "webhook_url": "https://dingtalk.ai.table/webhook",
-      "secret": "",
-      "enable": true
-    }
-  ],
-  "opinion_configs": [
-    {
-      "config_name": "负面",
-      "config_key": "负面",
-      "opinion_standard": "更新后的负面判断标准",
-      "broadcast_enable": true
-    }
-  ]
-}
+```http
+PUT /api/v1/projects/{project_id}
+Content-Type: application/json
 ```
 
-### 删除项目
+建议先 GET 当前项目，再只修改目标字段后 PUT，避免误清空。
 
-**端点**: `DELETE /openclaw/project/delete`
+## 常用字段
 
-**请求体**:
-```json
-{ "id": 30001 }
-```
+- `project_name`
+- `brand_description`
+- `brand_tags_description`
+- `competing_brand_description`
+- `search_key_list`
+- `crawl_config_json`
+- `opinion_configs_json`
+- `webhook_broadcast_configs_json`
+- `status`
 
-### 批量删除项目
+## 约束
 
-**端点**: `DELETE /openclaw/project/deleteByIds`
+- 仅使用 `/api/v1/projects*` 路径，不使用旧 `/openclaw/project/*`
+- `opinion_configs_json` 与 `webhook_broadcast_configs_json` 必须为 JSON 数组
+- `crawl_config_json` 必须为 JSON 对象
 
-**请求体**:
-```json
-{ "ids": [30001, 30002] }
-```
+## 项目查看响应约定（产品视角）
 
-## 错误码
+当意图是“查看项目内容/项目标准”时：
 
-| code | 说明 |
-|------|------|
-| 0 | 成功 |
-| 7 | 业务失败 |
-| 401 | 未授权 |
-| 404 | 资源不存在 |
+- 默认只返回产品信息：`project_name`、`id`、`brand_tags_description`、`brand_description`、`competing_brand_description`、`search_key_list`、`opinion_configs_json`
+- 默认不返回技术配置：`crawl_config_json`、`webhook_broadcast_configs_json`、API 鉴权和调度参数
+- 输出格式固定为表格：
+  - 项目基础信息（字段/内容）
+  - 主体标签（标签/描述）
+  - 舆情标准（类型/是否播报/判断标准）
+- 字段为空也需要保留表格行并显示“未配置”

@@ -1,147 +1,55 @@
 ---
 name: openclaw-opinion-callback
-description: 舆情结果回传。作品经过舆情分析后，回传至管理后台。当需要上传舆情分析结果、推送钉钉时使用此技能。触发词：上传舆情、回传结果、舆情上报。
+description: Relay 舆情结果回写。将分析结果写入本地 Relay 数据库，并供项目查询/汇总使用。触发词：回写舆情、上传分析结果、保存舆情。
 ---
 
-# 舆情结果回传
+# Relay 舆情回写
 
-将舆情分析结果回传至管理后台。
+## 迁移说明
 
-## ⚠️ 重要约束：必须记录思考过程
-
-**上传舆情分析结果时，必须填写 `opinion_think` 字段**，详细记录 AI 的判断推理过程：
-
-- **必须包含**：品牌识别过程、关键词匹配逻辑、情感判断依据
-- **必须包含**：最终的判断结论及其理由
-
-### 思考过程记录规范
-
-```json
-{
-  "opinion_think": "1. 品牌识别：从内容中识别出「卫仕」「醇粹」等自有品牌关键词\n2. 关键词匹配：检测到正向关键词「推荐」「种草」「好评」\n3. 情感分析：内容整体语气积极，无负面表达\n4. 舆情判断：提及自有品牌 + 正向关键词 → 正向\n5. 结论：该内容对品牌形象有正面价值，建议保持当前营销策略"
-}
-```
-
-### 示例：完整上传
-
-```json
-{
-  "skill": "openclaw-opinion-callback",
-  "action": "upload",
-  "params": {
-    "work_project_id": 30001,
-    "work_id": 90001,
-    "opinion_key": "正面",
-    "opinion_direction": "卫仕",
-    "opinion_think": "1. 品牌识别：内容提到「给猫主子换了卫仕猫粮」「猫咪很爱吃」\n2. 关键词匹配：检测到正向关键词「推荐」「爱吃」\n3. 情感分析：语气积极，用户对产品满意\n4. 舆情判断：提及自有品牌（卫仕）+ 正向关键词（推荐、爱吃）\n5. 结论：该内容为正向舆情，建议收集更多类似用户体验反馈",
-    "reason": "提及自有品牌「卫仕」且包含正向关键词「推荐」「爱吃」"
-  }
-}
-```
-
-## API 端点
-
-```
-POST http://127.0.0.1:8888/openclaw/opinion/upload
-```
+- 旧 `POST /openclaw/opinion/upload` 不再作为本地主链路。
+- 当前统一写回 Relay：`POST /api/v1/opinions`。
 
 ## 认证
 
-请求头：`api-key: <用户ApiKey>`
+请求头：`X-OpenClaw-API-Key: <relay_api_key>`
 
-## 请求参数
+## 回写接口
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| work_project_id | number | 是 | 项目ID |
-| work_id | number | 是 | 作品ID |
-| opinion_key | string | 是 | 舆情倾向（正面/负面/中性） |
-| opinion_direction | string | 是 | 主体品牌或指向 |
-| opinion_think | string | **是** | **AI 思考判断过程（必填）** |
-| reason | string | 是 | 分析原因摘要 |
+```text
+POST /api/v1/opinions
+```
 
-## 舆情倾向
-
-| 值 | 说明 |
-|----|------|
-| 正面 | 正面评价 |
-| 负面 | 负面评价 |
-| 中性 | 客观陈述 |
-
-## 返回格式
+请求示例：
 
 ```json
 {
-  "code": 0,
-  "data": {
-    "id": 123456789,
-    "work_id": 90001,
-    "work_project_id": 30001,
-    "opinion_key": "正面",
-    "opinion_direction": "卫仕",
-    "opinion_think": "1. 品牌识别...",
-    "reason": "提及品牌「卫仕」且包含正向关键词「推荐」",
-    "created_at": "2026-03-30T12:00:00Z",
-    "updated_at": "2026-03-30T12:00:10Z"
-  },
-  "msg": "成功"
+  "project_id": 1776650331436,
+  "work_id": 12345,
+  "opinion_key": "负面",
+  "opinion_direction": "品牌A",
+  "opinion_think": "1. 内容概述...\n2. 主体识别...\n3. 情绪依据...\n4. 判断过程...\n5. 结论...",
+  "reason": "内容表达对品牌售后服务强烈不满，整体为负面舆情。"
 }
 ```
 
-## 思考过程记录示例库
+## 必填字段约束
 
-### 正面舆情
+- `project_id`：项目数字主键
+- `work_id`：作品数字主键
+- `opinion_key`：正面/负面/中性
+- `opinion_direction`：主体品牌或对象
+- `opinion_think`：完整判断过程（必须是语义推理，不是词典命中）
+- `reason`：简洁判断依据
 
-```
-1. 品牌识别：内容提到「{品牌名}」
-2. 关键词匹配：检测到正向关键词「{关键词1}」「{关键词2}」
-3. 情感分析：{整体语气描述}
-4. 舆情判断：提及自有品牌 + 正向关键词 → 正面
-5. 结论：{最终判断及建议}
-```
+## 查询接口
 
-### 负面舆情
+- `GET /api/v1/works/{work_id}/opinion`
+- `GET /api/v1/projects/{project_id}/opinion-summary?days=7`
 
-```
-1. 品牌识别：内容提到「{品牌名}」
-2. 关键词匹配：检测到负向关键词「{关键词1}」「{关键词2}」
-3. 情感分析：{整体语气描述}
-4. 舆情判断：提及自有品牌 + 负向关键词 → 负面
-5. 结论：{问题点分析}
-```
+## 约束
 
-### 中性舆情
-
-```
-1. 品牌识别：{识别结果}
-2. 关键词匹配：未检测到正/负向关键词
-3. 情感分析：{整体语气描述}
-4. 舆情判断：无明显情感倾向 → 中性
-5. 结论：{客观陈述内容}
-```
-
-## 查询项目舆情记录
-
-**端点**: `GET /openclaw/opinion/list`
-
-```json
-{
-  "skill": "openclaw-opinion-callback",
-  "action": "list",
-  "params": {
-    "work_project_id": 30001,
-    "work_ids": [90001, 90002, 90003]
-  }
-}
-```
-
-**响应**:
-```json
-{
-  "code": 0,
-  "data": [],
-  "msg": "获取成功"
-}
-```
+- 禁止使用 `negativeWords/positiveWords` 之类词典匹配作为最终判定逻辑。
+- 必须结合项目配置（品牌、竞品、判断标准）与内容语义生成结果。
 
 详细 API 文档参见 [references/api.md](references/api.md)

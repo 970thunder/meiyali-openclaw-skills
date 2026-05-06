@@ -1,121 +1,30 @@
-# 舆情回传 API 文档
+# openclaw-opinion-callback API（Relay）
 
-## 端点
+## 写回舆情
 
-`POST /openclaw/opinion/upload`
+`POST /api/v1/opinions`
 
-## 认证
+请求头：
 
-请求头：`api-key: <用户ApiKey>`
+`X-OpenClaw-API-Key: <relay_api_key>`
 
-## 请求体
+请求体：
 
 ```json
 {
-  "work_project_id": 30001,
-  "work_id": 90001,
+  "project_id": 1776650331436,
+  "work_id": 12345,
   "opinion_key": "正面",
-  "opinion_direction": "卫仕",
-  "opinion_think": "1. 品牌识别：内容提到「给猫主子换了卫仕猫粮」\n2. 关键词匹配：检测到正向关键词「推荐」「爱吃」\n3. 情感分析：语气积极，用户对产品满意\n4. 舆情判断：提及自有品牌（卫仕）+ 正向关键词（推荐、爱吃）\n5. 结论：该内容为正向舆情",
-  "reason": "提及自有品牌「卫仕」且包含正向关键词「推荐」「爱吃」"
+  "opinion_direction": "品牌A",
+  "opinion_think": "完整推理过程",
+  "reason": "判断依据摘要"
 }
 ```
 
-## 字段说明
+## 查询单作品舆情
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| work_project_id | number | 是 | 项目ID |
-| work_id | number | 是 | 作品ID |
-| opinion_key | string | 是 | 舆情倾向（正面/负面/中性） |
-| opinion_direction | string | 是 | 主体品牌或指向 |
-| opinion_think | string | **是** | **AI 思考判断过程（必填）** |
-| reason | string | 是 | 分析原因摘要 |
+`GET /api/v1/works/{work_id}/opinion`
 
-## ⚠️ opinion_think 字段规范
+## 查询项目舆情汇总
 
-**必须包含以下 5 个部分的推理过程**：
-
-```
-1. 品牌识别：从内容中识别出哪些品牌（自有品牌/竞品）
-2. 关键词匹配：检测到哪些正向/负向关键词
-3. 情感分析：内容的整体语气和情感倾向
-4. 舆情判断：基于品牌+关键词的判断逻辑
-5. 结论：最终的舆情判断及建议
-```
-
-**示例**：
-```
-1. 品牌识别：从内容中识别出「卫仕」「醇粹」等自有品牌关键词
-2. 关键词匹配：检测到正向关键词「推荐」「种草」「好评」
-3. 情感分析：内容整体语气积极，无负面表达
-4. 舆情判断：提及自有品牌 + 正向关键词 → 正面
-5. 结论：该内容对品牌形象有正面价值，建议保持当前营销策略
-```
-
-## 舆情倾向枚举
-
-| 值 | 说明 |
-|----|------|
-| 正面 | 正面评价 |
-| 负面 | 负面评价 |
-| 中性 | 客观陈述 |
-
-## 响应
-
-```json
-{
-  "code": 0,
-  "data": {
-    "id": 123456789,
-    "work_id": 90001,
-    "work_project_id": 30001,
-    "opinion_key": "正面",
-    "opinion_direction": "卫仕",
-    "opinion_think": "1. 品牌识别...",
-    "reason": "提及自有品牌「卫仕」且包含正向关键词「推荐」「爱吃」",
-    "created_at": "2026-03-30T12:00:00Z",
-    "updated_at": "2026-03-30T12:00:10Z"
-  },
-  "msg": "成功"
-}
-```
-
-## 查询项目舆情记录列表
-
-**端点**: `GET /openclaw/opinion/list`
-
-**参数**:
-- `work_project_id`（必填）- 项目ID
-- `work_ids[]`（必填，多值）- 作品ID数组
-
-**示例**:
-
-`GET /openclaw/opinion/list?work_project_id=30001&work_ids[]=90001&work_ids[]=90002`
-
-**响应**:
-```json
-{
-  "code": 0,
-  "data": [],
-  "msg": "获取成功"
-}
-```
-
-**说明**:
-- 仅允许查询当前 `api-key` 对应 `yunfan_id` 自己项目的数据
-- 若 `work_project_id` 不属于当前用户，返回错误：`项目不存在或无权限`
-
-## 错误码
-
-| code | 说明 |
-|------|------|
-| 0 | 成功 |
-| 7 | 业务失败 |
-| 401 | 未授权 |
-| 404 | 项目不存在或无权限 |
-
-## 去重说明
-
-- 若已存在该 `work_id` + `work_project_id` 的 opinion 记录，则更新
-- 否则新建记录
+`GET /api/v1/projects/{project_id}/opinion-summary?days=7`

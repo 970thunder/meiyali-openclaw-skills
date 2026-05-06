@@ -1,196 +1,80 @@
 ---
 name: openclaw-project-config
-description: 舆情项目配置管理。用于获取、更新、创建舆情项目配置信息，包括产品信息、舆情标准、关键词、Webhook播报配置等。当需要查询项目设置、更新项目参数、获取项目列表、管理舆情配置时使用此技能。触发词：获取项目配置、更新项目、查询项目列表、舆情配置管理、关键词管理。
+description: Relay 项目配置管理。用于获取、更新、创建舆情项目配置信息（Relay 版）。触发词：获取项目配置、更新项目、查询项目列表、舆情配置管理。
 ---
 
-# 舆情项目配置管理
+# Relay 项目配置管理
 
-获取和管理舆情监控项目配置。
+## 认证
 
-## ⚠️ 首次使用必读
+请求头统一使用：
 
-### 1. API Key 配置（必需）
+`X-OpenClaw-API-Key: <relay_api_key>`
 
-所有 API 请求都需要有效的 API Key：
-
-```bash
-# 创建配置目录
-mkdir -p ~/.openclaw/workspace
-
-# 添加 API Key
-echo "OPENCLAW_API_KEY=your_api_key_here" >> ~/.openclaw/workspace/.env.meiyali
-```
-
-> 📌 **如何获取 API Key？**
-> 请联系管理员获取 OpenClaw 平台的 API Key
-
-### 2. API 端点
+## API 端点（Relay）
 
 | 操作 | 端点 | 方法 |
 |------|------|------|
-| 获取项目 | `http://127.0.0.1:8888/openclaw/project/find?id={id}` | GET |
-| 获取列表 | `http://127.0.0.1:8888/openclaw/project/list` | GET |
-| 创建项目 | `http://127.0.0.1:8888/openclaw/project/create` | POST |
-| 更新项目 | `http://127.0.0.1:8888/openclaw/project/update` | PUT |
-| 删除项目 | `http://127.0.0.1:8888/openclaw/project/delete` | DELETE |
-| 批量删除 | `http://127.0.0.1:8888/openclaw/project/deleteByIds` | DELETE |
+| 项目列表 | `/api/v1/projects` | GET |
+| 获取项目 | `/api/v1/projects/{project_id}` | GET |
+| 创建项目 | `/api/v1/projects` | POST |
+| 更新项目 | `/api/v1/projects/{project_id}` | PUT |
 
-### 3. 认证
+## 关键字段
 
-请求头：`api-key: <用户ApiKey>`
+- `project_name`
+- `brand_description`
+- `brand_tags_description`
+- `competing_brand_description`
+- `search_key_list`
+- `opinion_configs_json`
+- `webhook_broadcast_configs_json`
+- `crawl_config_json`
 
-> ⚠️ **必须配置 API Key**，否则所有请求都会返回 401 错误
+## 项目查看输出规范（必须执行）
 
-## 项目操作
+当用户意图是“查看项目相关内容/项目详情/项目标准”时，默认按**产品视角**输出，不输出技术配置细节。
 
-### 获取项目
+### 默认展示内容（必须）
 
-```json
-{
-  "skill": "openclaw-project-config",
-  "action": "get_project",
-  "params": { "id": <项目ID> }
-}
-```
+1. 项目基础信息（项目名、项目 ID）
+2. 主体标签与描述（由 `brand_tags_description` 解析）
+3. 品牌描述（`brand_description`）
+4. 竞品描述（`competing_brand_description`）
+5. 搜索词（`search_key_list`）
+6. 舆情判断标准（`opinion_configs_json` / `opinion_configs`）
+   - 负面 / 正面 / 中性全部完整列出
+   - 使用表格展示，不省略判断标准文本
 
-### 获取项目列表
+### 默认不展示内容（除非用户明确要求）
 
-```json
-{
-  "skill": "openclaw-project-config",
-  "action": "list_projects",
-  "params": { "page": 1, "pageSize": 10 }
-}
-```
+- `crawl_config_json`
+- 爬取平台列表（dy/xhs 等执行层配置）
+- `webhook_broadcast_configs_json` 及任何播报渠道密钥/群 ID
+- API 路径、鉴权头、任务调度参数等代码层信息
 
-### 创建项目
+### 表格格式要求（强约束）
 
-```json
-{
-  "skill": "openclaw-project-config",
-  "action": "create_project",
-  "params": {
-    "project_name": "猫粮舆情监控",
-    "brand_description": "XX品牌猫粮",
-    "brand_tags_description": "宠物/猫粮/口碑",
-    "competing_brand_description": "YY品牌，ZZ品牌",
-    "search_key_list": "猫粮,营养餐,宠物食品",
-    "webhook_broadcast_within_days": 7,
-    "webhook_broadcast_configs": [
-      {
-        "config_name": "钉钉多维表格播报",
-        "config_key": "dingding-ai-table",
-        "webhook_url": "https://dingtalk.ai.table/webhook",
-        "secret": "",
-        "enable": true
-      },
-      {
-        "config_name": "钉钉机器人播报",
-        "config_key": "dingding-robot",
-        "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
-        "secret": "ding-secret",
-        "enable": false
-      }
-    ],
-    "opinion_configs": [
-      {
-        "config_name": "负面",
-        "config_key": "负面",
-        "opinion_standard": "负面判断标准，如：产品质量问题、用户投诉等",
-        "broadcast_enable": true
-      },
-      {
-        "config_name": "正面",
-        "config_key": "正面",
-        "opinion_standard": "正面判断标准，如：用户好评、品牌赞美等",
-        "broadcast_enable": false
-      },
-      {
-        "config_name": "中性",
-        "config_key": "中性",
-        "opinion_standard": "中性判断标准，如：客观陈述、无明显情感倾向",
-        "broadcast_enable": false
-      }
-    ]
-  }
-}
-```
+- 项目基础信息：2 列表格（字段 / 内容）
+- 主体标签：2 列表格（标签 / 描述）
+- 舆情标准：3 列表格（类型 / 是否播报 / 判断标准）
+- `brand_tags_description` 若为“每行一个标签，格式：标签,描述”，按行拆分成表格
+- 如果某字段为空，也保留表格行并明确写“未配置”
 
-> 📌 **字段说明：**
-> - `search_key_list`: 关键词列表，逗号分隔
-> - `webhook_broadcast_within_days`: Webhook 播报时间范围（天数），0 表示不限制
-> - `webhook_broadcast_configs`: Webhook 播报配置数组
->   - `config_name`: 配置名称
->   - `config_key`: 配置唯一标识
->   - `webhook_url`: Webhook 地址
->   - `secret`: 签名密钥（钉钉需要）
->   - `enable`: 是否启用
-> - `opinion_configs`: 舆情配置数组
->   - `config_name`: 配置名称（负面/正面/中性）
->   - `config_key`: 配置唯一标识
->   - `opinion_standard`: 舆情判断标准描述
->   - `broadcast_enable`: 是否启用播报
+## 推荐读改流程
 
-### 更新项目
+1. 先读当前配置：`GET /api/v1/projects/{project_id}`
+2. 基于当前配置修改目标字段（不要随意清空未修改字段）
+3. 用 `PUT /api/v1/projects/{project_id}` 一次性提交
+4. 更新后再次 `GET /api/v1/projects/{project_id}` 回读校验
 
-```json
-{
-  "skill": "openclaw-project-config",
-  "action": "update_project",
-  "params": {
-    "id": <项目ID>,
-    "project_name": "猫粮舆情监控（更新）",
-    "brand_description": "XX品牌猫粮（更新）",
-    "search_key_list": "猫粮,营养餐,宠物食品",
-    "webhook_broadcast_within_days": 7,
-    "webhook_broadcast_configs": [
-      {
-        "config_name": "钉钉多维表格播报",
-        "config_key": "dingding-ai-table",
-        "webhook_url": "https://dingtalk.ai.table/webhook",
-        "secret": "",
-        "enable": true
-      }
-    ],
-    "opinion_configs": [
-      {
-        "config_name": "负面",
-        "config_key": "负面",
-        "opinion_standard": "更新后的负面判断标准",
-        "broadcast_enable": true
-      }
-    ]
-  }
-}
-```
+## 严格约束
 
-### 删除项目
+- 仅使用 Relay `projects` 系列接口
+- 禁止使用旧链路 `/openclaw/project/*`
+- 涉及 JSON 字段时，必须保持合法 JSON 结构
+  - `opinion_configs_json` 必须是数组
+  - `webhook_broadcast_configs_json` 必须是数组
+  - `crawl_config_json` 必须是对象，常用 `platforms` 字段
 
-```json
-{
-  "skill": "openclaw-project-config",
-  "action": "delete_project",
-  "params": { "id": <项目ID> }
-}
-```
-
-### 批量删除项目
-
-```json
-{
-  "skill": "openclaw-project-config",
-  "action": "delete_projects",
-  "params": { "ids": [<项目ID1>, <项目ID2>] }
-}
-```
-
-## 常见错误
-
-| 错误信息 | 原因 | 解决方案 |
-|---------|------|---------|
-| `401 Unauthorized` | API Key 无效或未配置 | 配置有效的 `OPENCLAW_API_KEY` |
-| `404 Not Found` | 项目不存在 | 检查 ID 是否正确 |
-| `Validation failed` | 必填字段缺失 | 检查请求参数 |
-| `已达到可创建舆情项目上限` | 会员项目数量已达上限 | 升级会员或删除已有项目 |
-
-详细 API 文档参见 [references/api.md](references/api.md)
+详细参见 [references/api.md](references/api.md)
